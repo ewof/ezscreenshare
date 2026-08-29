@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { AccessToken, RoomServiceClient } from "livekit-server-sdk";
 import { acceptWebsocket, type WsClient } from "./fallback-ws.ts";
 
-type Watcher = { ws: WsClient; name: string; id: string };
+type Watcher = { ws: WsClient; name: string; id: string; rtt?: number };
 type RoomRecord = {
   id: string;
   passwordHash: Buffer | null;
@@ -238,7 +238,7 @@ function notifyHost(rec: RoomRecord): void {
   rec.ingest?.send(
     JSON.stringify({
       t: "watchers",
-      viewers: [...rec.watchers].map((w) => ({ name: w.name, id: w.id })),
+      viewers: [...rec.watchers].map((w) => ({ name: w.name, id: w.id, rtt: w.rtt })),
     }),
   );
 }
@@ -259,7 +259,7 @@ async function mintToken(opts: {
     room: opts.room,
     canPublish: opts.canPublish,
     canSubscribe: true,
-    canPublishData: opts.canPublish,
+    canPublishData: true,
     canUpdateOwnMetadata: opts.canPublish,
   });
   return at.toJwt();
@@ -602,10 +602,21 @@ server.on("upgrade", (req, socket, head) => {
       onMessage(data, isBinary) {
         if (isBinary || !watcher) return;
         try {
-          const msg = JSON.parse(data.toString()) as { t?: string; name?: string; id?: string };
+          const msg = JSON.parse(data.toString()) as {
+            t?: string;
+            name?: string;
+            id?: string;
+            n?: number;
+            ms?: number;
+          };
           if (msg.t === "hello") {
             if (typeof msg.name === "string") watcher.name = msg.name.trim().slice(0, 32) || watcher.name;
             if (typeof msg.id === "string") watcher.id = msg.id.trim().slice(0, 64);
+            notifyHost(rec);
+          } else if (msg.t === "ping") {
+            watcher.ws.send(JSON.stringify({ t: "pong", n: msg.n }));
+          } else if (msg.t === "rtt" && typeof msg.ms === "number" && Number.isFinite(msg.ms)) {
+            watcher.rtt = Math.round(Math.min(60_000, Math.max(0, msg.ms)));
             notifyHost(rec);
           }
         } catch {

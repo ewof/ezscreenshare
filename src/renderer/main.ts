@@ -128,6 +128,158 @@ function fallbackUrl(path: string): string {
   return `${proto}://${location.host}${path}`;
 }
 
+function pingClass(ms: number): "ok" | "warn" | "bad" {
+  if (ms < 80) return "ok";
+  if (ms < 180) return "warn";
+  return "bad";
+}
+
+function setPingPill(el: HTMLElement | null, ms: number | undefined): void {
+  if (!el) return;
+  el.classList.remove("ok", "warn", "bad");
+  if (ms == null || !Number.isFinite(ms)) {
+    el.textContent = "ping —";
+    return;
+  }
+  el.textContent = `${ms} ms`;
+  el.classList.add(pingClass(ms));
+}
+
+type PersonRow = { name: string; role: string; ms?: number };
+
+function renderPeople(ul: HTMLElement, rows: PersonRow[]): void {
+  ul.replaceChildren();
+  if (!rows.length) {
+    const li = document.createElement("li");
+    const s = document.createElement("span");
+    s.className = "sub";
+    s.textContent = "nobody yet";
+    li.appendChild(s);
+    ul.appendChild(li);
+    return;
+  }
+  for (const row of rows) {
+    const li = document.createElement("li");
+    const n = document.createElement("span");
+    n.textContent = row.name;
+    const right = document.createElement("span");
+    right.className = "person-meta";
+    if (row.ms != null && Number.isFinite(row.ms)) {
+      const p = document.createElement("span");
+      p.className = `ping ${pingClass(row.ms)}`;
+      p.textContent = `${row.ms} ms`;
+      right.appendChild(p);
+    }
+    const r = document.createElement("span");
+    r.className = "sub";
+    r.textContent = row.role;
+    right.appendChild(r);
+    li.append(n, right);
+    ul.appendChild(li);
+  }
+}
+
+function rttFromReport(report: RTCStatsReport): number | undefined {
+  let best: number | undefined;
+  report.forEach((s) => {
+    const rec = s as {
+      type?: string;
+      currentRoundTripTime?: number;
+      roundTripTime?: number;
+      nominated?: boolean;
+      state?: string;
+    };
+    let sec: number | undefined;
+    if (rec.type === "candidate-pair" && (rec.nominated || rec.state === "succeeded")) {
+      sec = rec.currentRoundTripTime;
+    } else if (rec.type === "remote-inbound-rtp" || rec.type === "remote-outbound-rtp") {
+      sec = rec.roundTripTime;
+    }
+    if (sec == null || !Number.isFinite(sec) || sec < 0) return;
+    const ms = Math.round(sec < 10 ? sec * 1000 : sec);
+    if (best == null || ms < best) best = ms;
+  });
+  return best;
+}
+
+async function roomRttMs(room: Room): Promise<number | undefined> {
+  const pubs = [
+    ...room.localParticipant.trackPublications.values(),
+    ...[...room.remoteParticipants.values()].flatMap((p) => [...p.trackPublications.values()]),
+  ];
+  for (const pub of pubs) {
+    const track = pub.track as (LocalVideoTrack & { getSenderStats?: () => Promise<{ roundTripTime?: number }[]> }) | null;
+    if (!track) continue;
+    if (typeof track.getSenderStats === "function") {
+      try {
+        const stats = await track.getSenderStats();
+        const list = Array.isArray(stats) ? stats : stats ? [stats] : [];
+        for (const s of list) {
+          if (s.roundTripTime == null || !Number.isFinite(s.roundTripTime)) continue;
+          const v = s.roundTripTime;
+          return Math.round(v < 10 ? v * 1000 : v);
+        }
+      } catch {
+        /* try RTCStats next */
+      }
+    }
+    try {
+      const report = await track.getRTCStatsReport();
+      const ms = report ? rttFromReport(report) : undefined;
+      if (ms != null) return ms;
+    } catch {
+      /* next publication */
+    }
+  }
+  return undefined;
+}
+
+function bindRoomPing(
+  room: Room,
+  identity: string,
+  pingById: Map<string, number>,
+  onUpdate: (ownMs: number | undefined) => void,
+): () => void {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const onData = (payload: Uint8Array, participant?: { identity: string }): void => {
+    try {
+      const msg = JSON.parse(decoder.decode(payload)) as { t?: string; ms?: unknown };
+      if (msg.t !== "ezs-ping" || typeof msg.ms !== "number" || !participant) return;
+      if (!Number.isFinite(msg.ms)) return;
+      const ms = Math.round(Math.min(60_000, Math.max(0, msg.ms)));
+      pingById.set(participant.identity, ms);
+      onUpdate(pingById.get(identity));
+    } catch {
+      /* ignore */
+    }
+  };
+  room.on(RoomEvent.DataReceived, onData);
+  const tick = async (): Promise<void> => {
+    const ms = (await roomRttMs(room)) ?? pingById.get(identity);
+    if (ms == null) {
+      onUpdate(undefined);
+      return;
+    }
+    pingById.set(identity, ms);
+    onUpdate(ms);
+    try {
+      await room.localParticipant.publishData(encoder.encode(JSON.stringify({ t: "ezs-ping", ms })), {
+        reliable: false,
+        topic: "ezs-ping",
+      });
+    } catch {
+      /* room gone */
+    }
+  };
+  const id = window.setInterval(() => void tick(), 2000);
+  void tick();
+  return () => {
+    window.clearInterval(id);
+    room.off(RoomEvent.DataReceived, onData);
+  };
+}
+
 function openFallback(path: string, token: string): WebSocket {
   return new WebSocket(fallbackUrl(path), ["ezs", token]);
 }
@@ -148,7 +300,7 @@ function startIngest(
   stream: MediaStream,
   roomId: string,
   ingestToken: string,
-  onWatchers: (viewers: { name: string; id: string }[]) => void,
+  onWatchers: (viewers: { name: string; id: string; rtt?: number }[]) => void,
 ): { stop: () => void; setStream: (s: MediaStream) => void; setFps: (fps: number) => void } {
   const ws = openFallback(`/ws/ingest/${encodeURIComponent(roomId)}`, ingestToken);
   // Video-only clone: attaching the live stream to a muted <video> mutes published audio in Chromium.
@@ -268,7 +420,7 @@ function startIngest(
       const msg = JSON.parse(ev.data) as {
         t?: string;
         names?: string[];
-        viewers?: { name: string; id: string }[];
+        viewers?: { name: string; id: string; rtt?: number }[];
       };
       if (msg.t === "watchers" && Array.isArray(msg.viewers)) onWatchers(msg.viewers);
       else if (msg.t === "watchers" && Array.isArray(msg.names)) {
@@ -308,6 +460,7 @@ function startWatch(
     isRtcLive: () => boolean;
     onFrame: () => void;
     onPcm: (rate: number, samples: Int16Array) => void;
+    onRtt?: (ms: number) => void;
   },
 ): () => void {
   let stopped = false;
@@ -316,6 +469,8 @@ function startWatch(
   let applying = false;
   let lastWs = 0;
   let wsOpen = false;
+  let pingN = 0;
+  const pendingPing = new Map<number, number>();
   const applyJpeg = (data: Blob | ArrayBuffer | Uint8Array): void => {
     if (stopped || applying || opts.isRtcLive()) {
       if (opts.isRtcLive()) img.classList.add("hidden");
@@ -390,13 +545,37 @@ function startWatch(
   ws.addEventListener("close", () => {
     wsOpen = false;
   });
+  const pingTimer = window.setInterval(() => {
+    if (stopped || ws.readyState !== WebSocket.OPEN) return;
+    pingN = (pingN + 1) % 1_000_000;
+    pendingPing.set(pingN, performance.now());
+    if (pendingPing.size > 8) pendingPing.delete(pendingPing.keys().next().value!);
+    ws.send(JSON.stringify({ t: "ping", n: pingN }));
+  }, 2000);
   ws.addEventListener("message", (ev) => {
-    if (typeof ev.data === "string") return;
+    if (typeof ev.data === "string") {
+      try {
+        const msg = JSON.parse(ev.data) as { t?: string; n?: number };
+        if (msg.t === "pong" && typeof msg.n === "number") {
+          const t0 = pendingPing.get(msg.n);
+          pendingPing.delete(msg.n);
+          if (t0 != null) {
+            const ms = Math.round(performance.now() - t0);
+            ws.send(JSON.stringify({ t: "rtt", ms }));
+            opts.onRtt?.(ms);
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
     handleBuf(new Uint8Array(ev.data as ArrayBuffer));
   });
   return () => {
     stopped = true;
     window.clearTimeout(timer);
+    window.clearInterval(pingTimer);
     img.onload = null;
     img.onerror = null;
     img.removeAttribute("src");
@@ -609,7 +788,7 @@ function renderHost(): void {
         </div>
         <button class="btn secondary" id="theme" type="button">light</button>
       </div>
-      <div id="setup" class="panel">
+      <form id="setup" class="panel">
         <div class="row">
           <label class="field">nickname
             <input id="nick" type="text" maxlength="32" />
@@ -655,15 +834,16 @@ function renderHost(): void {
           <div id="sources" class="sources"></div>
         </div>
         <div class="row">
-          <button class="btn" id="start" type="button">start stream</button>
+          <button class="btn" id="start" type="submit">start stream</button>
           <button class="btn secondary ${isElectron ? "" : "hidden"}" id="refresh" type="button">refresh sources</button>
         </div>
         <div class="err" id="err"></div>
-      </div>
+      </form>
       <div id="live" class="hidden">
         <div class="stage"><video id="preview" autoplay muted playsinline></video></div>
         <div class="hud">
           <span class="pill live">LIVE</span>
+          <span class="pill" id="ping">ping —</span>
           <span class="pill" id="audioState">audio ?</span>
           <div class="linkbox">
             <input id="link" class="mono" type="text" readonly />
@@ -727,7 +907,9 @@ function renderHost(): void {
   let videoPub: LocalTrackPublication | null = null;
   let audioPub: LocalTrackPublication | null = null;
   let ingest: ReturnType<typeof startIngest> | null = null;
-  let fallbackWatchers: { name: string; id: string }[] = [];
+  let fallbackWatchers: { name: string; id: string; rtt?: number }[] = [];
+  const pingById = new Map<string, number>();
+  let stopPing: (() => void) | null = null;
 
   async function loadSources(box: HTMLElement, onPick?: (s: Source) => void): Promise<void> {
     if (!window.ez) return;
@@ -816,34 +998,38 @@ function renderHost(): void {
       : [];
     const rtcIds = new Set(rtcPeople.map((p) => p.identity));
     const rtcNames = new Set(rtcPeople.map((p) => (p.name || "").toLowerCase()).filter(Boolean));
-    ul.replaceChildren();
-    const addRow = (name: string, role: string): void => {
-      const li = document.createElement("li");
-      const n = document.createElement("span");
-      n.textContent = name;
-      const r = document.createElement("span");
-      r.className = "sub";
-      r.textContent = role;
-      li.append(n, r);
-      ul.appendChild(li);
+    const rows: PersonRow[] = [];
+    const rttOf = (id: string, name: string): number | undefined => {
+      const mapped = pingById.get(id);
+      if (mapped != null) return mapped;
+      const lower = name.toLowerCase();
+      for (const w of fallbackWatchers) {
+        if (w.rtt == null) continue;
+        if (w.id && w.id === id) return w.rtt;
+        if (w.name && w.name.toLowerCase() === lower) return w.rtt;
+      }
+      return undefined;
     };
     for (const p of rtcPeople) {
       const you = room && p === room.localParticipant ? " (you)" : "";
-      addRow(`${p.name || p.identity}${you}`, p.identity === "host" ? "host" : "viewer");
+      const name = p.name || p.identity;
+      rows.push({
+        name: `${name}${you}`,
+        role: p.identity === "host" ? "host" : "viewer",
+        ms: rttOf(p.identity, name),
+      });
     }
     for (const w of fallbackWatchers) {
       if (w.id && rtcIds.has(w.id)) continue;
       if (w.name && rtcNames.has(w.name.toLowerCase())) continue;
-      addRow(w.name || w.id || "viewer", "viewer");
+      rows.push({
+        name: w.name || w.id || "viewer",
+        role: "viewer",
+        ms: w.rtt ?? (w.id ? pingById.get(w.id) : undefined),
+      });
     }
-    if (!ul.childElementCount) {
-      const li = document.createElement("li");
-      const s = document.createElement("span");
-      s.className = "sub";
-      s.textContent = "nobody yet";
-      li.appendChild(s);
-      ul.appendChild(li);
-    }
+    renderPeople(ul, rows);
+    setPingPill(document.querySelector("#ping"), pingById.get("host"));
   }
 
   async function publish(stream: MediaStream): Promise<void> {
@@ -923,10 +1109,16 @@ function renderHost(): void {
       room.on(RoomEvent.ParticipantDisconnected, people);
       room.on(RoomEvent.Disconnected, () => void stop());
       await room.connect(created.livekitUrl, created.token);
+      stopPing?.();
+      pingById.clear();
+      stopPing = bindRoomPing(room, "host", pingById, () => people());
       await publish(stream);
       ingest?.stop();
       ingest = startIngest(stream, created.roomId, created.ingestToken, (viewers) => {
         fallbackWatchers = viewers;
+        for (const w of viewers) {
+          if (w.id && w.rtt != null) pingById.set(w.id, w.rtt);
+        }
         people();
       });
       ingest.setFps(Number(qs<HTMLSelectElement>("#compatFps").value) || 5);
@@ -944,6 +1136,9 @@ function renderHost(): void {
   }
 
   async function stop(): Promise<void> {
+    stopPing?.();
+    stopPing = null;
+    pingById.clear();
     ingest?.stop();
     ingest = null;
     fallbackWatchers = [];
@@ -959,7 +1154,10 @@ function renderHost(): void {
     history.replaceState(null, "", "/");
   }
 
-  qs("#start").addEventListener("click", () => void start());
+  qs("#setup").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    void start();
+  });
   qs("#stop").addEventListener("click", () => void stop());
   qs("#copy").addEventListener("click", async () => {
     const btn = qs("#copy");
@@ -1082,18 +1280,18 @@ function renderViewer(roomId: string): void {
         </div>
         <button class="btn secondary" id="theme" type="button">light</button>
       </div>
-      <div id="gate" class="panel">
+      <form id="gate" class="panel">
         <div class="row">
           <label class="field">nickname
             <input id="nick" type="text" maxlength="32" />
           </label>
           <label class="field">password
-            <input id="password" type="password" autocomplete="off" />
+            <input id="password" type="password" autocomplete="current-password" />
           </label>
         </div>
-        <div class="row"><button class="btn" id="join" type="button">join</button></div>
+        <div class="row"><button class="btn" id="join" type="submit">join</button></div>
         <div class="err" id="err"></div>
-      </div>
+      </form>
       <div id="watch" class="hidden">
         <div class="stage">
           <video id="remote" autoplay playsinline webkit-playsinline controls></video>
@@ -1101,6 +1299,11 @@ function renderViewer(roomId: string): void {
         </div>
         <div class="hud">
           <span class="pill" id="status">connecting</span>
+          <span class="pill" id="ping">ping —</span>
+        </div>
+        <div class="panel people-panel">
+          <div class="sub">connected</div>
+          <ul class="people" id="people"></ul>
         </div>
       </div>
     </div>
@@ -1114,10 +1317,39 @@ function renderViewer(roomId: string): void {
   const err = qs("#err");
   let room: Room | null = null;
   let stopWatch: (() => void) | null = null;
+  let stopPing: (() => void) | null = null;
   let rtcLive = false;
   let pcmCtx: AudioContext | null = null;
   let pcmGain: GainNode | null = null;
   let pcmAt = 0;
+  const pingById = new Map<string, number>();
+  const selfId = viewerIdentity();
+
+  function people(): void {
+    const ul = document.querySelector<HTMLElement>("#people");
+    if (!ul) return;
+    const rtcPeople = room
+      ? [room.localParticipant, ...Array.from(room.remoteParticipants.values())]
+      : [];
+    const rows: PersonRow[] = rtcPeople.map((p) => {
+      const you = room && p === room.localParticipant ? " (you)" : "";
+      return {
+        name: `${p.name || p.identity}${you}`,
+        role: p.identity === "host" ? "host" : "viewer",
+        ms: pingById.get(p.identity),
+      };
+    });
+    if (!rows.length) {
+      const n = document.querySelector<HTMLInputElement>("#nick")?.value.trim() || "viewer";
+      rows.push({
+        name: `${n} (you)`,
+        role: "viewer",
+        ms: pingById.get(selfId),
+      });
+    }
+    renderPeople(ul, rows);
+    setPingPill(document.querySelector("#ping"), pingById.get(selfId) ?? pingById.get(room?.localParticipant.identity ?? ""));
+  }
 
   function setStatus(text: string, live: boolean): void {
     const el = qs("#status");
@@ -1182,7 +1414,8 @@ function renderViewer(roomId: string): void {
   }
 
   const joinBtn = qs<HTMLButtonElement>("#join");
-  qs("#join").addEventListener("click", async () => {
+  qs("#gate").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
     err.textContent = "";
     localStorage.setItem(nickKey, nick.value.trim() || "viewer");
     joinBtn.disabled = true;
@@ -1201,11 +1434,15 @@ function renderViewer(roomId: string): void {
       room.on(RoomEvent.TrackPublished, (pub, p) => {
         if (p.identity === "host") void pub.setSubscribed(true);
       });
+      room.on(RoomEvent.ParticipantConnected, people);
+      room.on(RoomEvent.ParticipantDisconnected, people);
       room.on(RoomEvent.Disconnected, () => {
         rtcLive = false;
         if (!compat.classList.contains("hidden")) setStatus("compatibility", true);
       });
       stopWatch?.();
+      stopPing?.();
+      pingById.clear();
       pcmCtx ??= new AudioContext();
       void pcmCtx.resume();
       video.muted = false;
@@ -1229,16 +1466,36 @@ function renderViewer(roomId: string): void {
             }
           },
           onPcm: playPcm,
+          onRtt: (ms) => {
+            pingById.set(selfId, ms);
+            const liveId = room?.localParticipant.identity;
+            if (liveId) pingById.set(liveId, ms);
+            people();
+            if (room) {
+              void room.localParticipant
+                .publishData(new TextEncoder().encode(JSON.stringify({ t: "ezs-ping", ms })), {
+                  reliable: false,
+                  topic: "ezs-ping",
+                })
+                .catch(() => undefined);
+            }
+          },
         },
       );
+      people();
       void room
         .connect(joined.livekitUrl, joined.token, { peerConnectionTimeout: 20_000 })
         .then(() => {
+          stopPing?.();
+          stopPing = bindRoomPing(room!, room!.localParticipant.identity || selfId, pingById, () =>
+            people(),
+          );
           for (const p of room!.remoteParticipants.values()) {
             for (const pub of p.trackPublications.values()) {
               if (pub.track) attach(pub.track as RemoteTrack, pub as RemoteTrackPublication, p);
             }
           }
+          people();
         })
         .catch(() => {
           /* SOCKS/LibreWolf often cannot ICE; HTTP JPEG path is the real viewer. */

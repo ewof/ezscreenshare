@@ -285,6 +285,40 @@ function openFallback(path: string, token: string): WebSocket {
 }
 
 const PCM_MAGIC = [0x45, 0x5a, 0x53, 0x41]; // EZSA
+const VID_MAGIC = [0x45, 0x5a, 0x53, 0x56]; // EZSV
+const VID_CFG = 0;
+const VID_FRAME = 3;
+const VID_JPEG = 5;
+
+function copyAb(u8: Uint8Array): ArrayBuffer {
+  const out = new ArrayBuffer(u8.byteLength);
+  new Uint8Array(out).set(u8);
+  return out;
+}
+
+function packVid(kind: number, payload: Uint8Array): Uint8Array {
+  const out = new Uint8Array(5 + payload.length);
+  out[0] = VID_MAGIC[0]!;
+  out[1] = VID_MAGIC[1]!;
+  out[2] = VID_MAGIC[2]!;
+  out[3] = VID_MAGIC[3]!;
+  out[4] = kind;
+  out.set(payload, 5);
+  return out;
+}
+
+function parseVid(buf: Uint8Array): { kind: number; payload: Uint8Array } | null {
+  if (
+    buf.length < 6 ||
+    buf[0] !== VID_MAGIC[0] ||
+    buf[1] !== VID_MAGIC[1] ||
+    buf[2] !== VID_MAGIC[2] ||
+    buf[3] !== VID_MAGIC[3]
+  ) {
+    return null;
+  }
+  return { kind: buf[4]!, payload: buf.subarray(5) };
+}
 
 function isPcmPacket(buf: Uint8Array): boolean {
   return (
@@ -300,10 +334,9 @@ function startIngest(
   stream: MediaStream,
   roomId: string,
   ingestToken: string,
-  onWatchers: (viewers: { name: string; id: string; rtt?: number }[]) => void,
+  onWatchers: (viewers: { name: string; id: string; rtt?: number; jpeg?: boolean }[]) => void,
 ): { stop: () => void; setStream: (s: MediaStream) => void; setFps: (fps: number) => void } {
   const ws = openFallback(`/ws/ingest/${encodeURIComponent(roomId)}`, ingestToken);
-  // Video-only clone: attaching the live stream to a muted <video> mutes published audio in Chromium.
   const tap = document.createElement("video");
   tap.muted = true;
   tap.playsInline = true;
@@ -314,16 +347,21 @@ function startIngest(
   tap.height = 90;
   document.body.appendChild(tap);
   const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
-  const postUrl = `/api/rooms/${encodeURIComponent(roomId)}/frame`;
-  const postHeaders = { "content-type": "image/jpeg", authorization: `Bearer ${ingestToken}` };
-  let timer = 0;
-  let sending = false;
-  let intervalMs = 200;
+  const ctx = canvas.getContext("2d", { alpha: false });
+  let srcStream = stream;
+  let fps = 15;
+  let drawTimer = 0;
+  let frameN = 0;
+  let enc: VideoEncoder | null = null;
+  let encW = 0;
+  let encH = 0;
+  let wantJpeg = false;
+  let jpegBusy = false;
   let ac: AudioContext | null = null;
   let audioSrc: MediaStreamAudioSourceNode | null = null;
   let audioProc: ScriptProcessorNode | null = null;
   let audioMute: GainNode | null = null;
+  const utf8 = new TextEncoder();
 
   const bindVideo = (s: MediaStream): void => {
     tap.srcObject = new MediaStream(s.getVideoTracks());
@@ -355,7 +393,6 @@ function startIngest(
     mute.gain.value = 0;
     src.connect(proc);
     proc.connect(mute);
-    // Never route capture to speakers — that howls through the headset.
     mute.connect(ac.createMediaStreamDestination());
     proc.onaudioprocess = (ev) => {
       if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 256_000) return;
@@ -379,51 +416,97 @@ function startIngest(
     audioMute = mute;
   };
 
-  bindVideo(stream);
-  hookAudio(stream);
+  const closeEnc = (): void => {
+    try {
+      enc?.close();
+    } catch {
+      /* ignore */
+    }
+    enc = null;
+    encW = 0;
+    encH = 0;
+  };
 
-  const tick = (): void => {
-    if (!ctx || tap.videoWidth < 2 || sending) return;
-    if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount > 512_000) return;
-    const w = tap.videoWidth;
-    const h = tap.videoHeight;
+  const ensureEnc = (w: number, h: number): VideoEncoder | null => {
+    if (typeof VideoEncoder === "undefined") return null;
+    if (enc && encW === w && encH === h && enc.state === "configured") return enc;
+    closeEnc();
+    const next = new VideoEncoder({
+      output(chunk) {
+        if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 256_000) return;
+        const data = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(data);
+        const payload = new Uint8Array(5 + data.length);
+        payload[0] = chunk.type === "key" ? 1 : 0;
+        new DataView(payload.buffer).setUint32(1, chunk.timestamp >>> 0, true);
+        payload.set(data, 5);
+        ws.send(packVid(VID_FRAME, payload));
+      },
+      error(err) {
+        console.warn("[ezscreenshare] encode", err);
+      },
+    });
+    next.configure({
+      codec: "vp8",
+      width: w,
+      height: h,
+      bitrate: 700_000,
+      framerate: fps,
+      latencyMode: "realtime",
+    });
+    enc = next;
+    encW = w;
+    encH = h;
+    ws.send(packVid(VID_CFG, utf8.encode(JSON.stringify({ codec: "vp8", w, h }))));
+    return next;
+  };
+
+  const paint = (): void => {
+    if (!ctx || tap.videoWidth < 2) return;
+    const scale = tap.videoWidth > 854 ? 854 / tap.videoWidth : 1;
+    const w = Math.max(2, Math.round(tap.videoWidth * scale) & ~1);
+    const h = Math.max(2, Math.round(tap.videoHeight * scale) & ~1);
     if (canvas.width !== w) canvas.width = w;
     if (canvas.height !== h) canvas.height = h;
     ctx.drawImage(tap, 0, 0, w, h);
-    sending = true;
-    canvas.toBlob(
-      (blob) => {
-        if (!blob) {
-          sending = false;
-          return;
-        }
-        const send = blob;
-        if (ws.readyState === WebSocket.OPEN) ws.send(send);
-        void fetch(postUrl, { method: "POST", body: send, headers: postHeaders })
-          .catch(() => undefined)
-          .finally(() => {
-            sending = false;
-          });
-      },
-      "image/jpeg",
-      0.55,
-    );
+    const encoder = ensureEnc(w, h);
+    if (encoder && encoder.encodeQueueSize < 4) {
+      const ts = Math.round((frameN * 1_000_000) / fps);
+      const vf = new VideoFrame(canvas, { timestamp: ts });
+      encoder.encode(vf, { keyFrame: frameN % 10 === 0 });
+      vf.close();
+      frameN++;
+    }
+    if (wantJpeg && !jpegBusy && ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 128_000) {
+      jpegBusy = true;
+      canvas.toBlob(
+        (blob) => {
+          jpegBusy = false;
+          if (!blob || ws.readyState !== WebSocket.OPEN) return;
+          void blob.arrayBuffer().then((ab) => ws.send(packVid(VID_JPEG, new Uint8Array(ab))));
+        },
+        "image/jpeg",
+        0.5,
+      );
+    }
   };
-  const arm = (): void => {
-    window.clearInterval(timer);
-    timer = window.setInterval(tick, intervalMs);
-  };
-  arm();
+
+  bindVideo(srcStream);
+  hookAudio(srcStream);
+  drawTimer = window.setInterval(paint, Math.round(1000 / fps));
+
   ws.addEventListener("message", (ev) => {
     if (typeof ev.data !== "string") return;
     try {
       const msg = JSON.parse(ev.data) as {
         t?: string;
         names?: string[];
-        viewers?: { name: string; id: string; rtt?: number }[];
+        viewers?: { name: string; id: string; rtt?: number; jpeg?: boolean }[];
       };
-      if (msg.t === "watchers" && Array.isArray(msg.viewers)) onWatchers(msg.viewers);
-      else if (msg.t === "watchers" && Array.isArray(msg.names)) {
+      if (msg.t === "watchers" && Array.isArray(msg.viewers)) {
+        wantJpeg = msg.viewers.some((v) => v.jpeg);
+        onWatchers(msg.viewers);
+      } else if (msg.t === "watchers" && Array.isArray(msg.names)) {
         onWatchers(msg.names.map((name) => ({ name, id: "" })));
       }
     } catch {
@@ -432,15 +515,20 @@ function startIngest(
   });
   return {
     setStream(next) {
+      srcStream = next;
       bindVideo(next);
       hookAudio(next);
+      closeEnc();
     },
-    setFps(fps: number) {
-      intervalMs = Math.round(1000 / Math.max(1, Math.min(30, fps)));
-      arm();
+    setFps(next) {
+      fps = Math.max(2, Math.min(30, next));
+      window.clearInterval(drawTimer);
+      drawTimer = window.setInterval(paint, Math.round(1000 / fps));
+      closeEnc();
     },
     stop() {
-      window.clearInterval(timer);
+      window.clearInterval(drawTimer);
+      closeEnc();
       unhookAudio();
       void ac?.close();
       tap.srcObject = null;
@@ -451,7 +539,7 @@ function startIngest(
 }
 
 function startWatch(
-  img: HTMLImageElement,
+  canvas: HTMLCanvasElement,
   roomId: string,
   watchToken: string,
   nick: string,
@@ -462,49 +550,112 @@ function startWatch(
     onPcm: (rate: number, samples: Int16Array) => void;
     onRtt?: (ms: number) => void;
   },
-): () => void {
+): { stop: () => void; setRtc: (on: boolean) => void } {
   let stopped = false;
-  let timer = 0;
-  let objectUrl = "";
-  let applying = false;
-  let lastWs = 0;
-  let wsOpen = false;
   let pingN = 0;
   const pendingPing = new Map<number, number>();
-  const applyJpeg = (data: Blob | ArrayBuffer | Uint8Array): void => {
-    if (stopped || applying || opts.isRtcLive()) {
-      if (opts.isRtcLive()) img.classList.add("hidden");
+  const ctx = canvas.getContext("2d", { alpha: false });
+  let decoder: VideoDecoder | null = null;
+  let waitingKey = true;
+  const canDecode = typeof VideoDecoder !== "undefined";
+
+  const closeDec = (): void => {
+    try {
+      decoder?.close();
+    } catch {
+      /* ignore */
+    }
+    decoder = null;
+    waitingKey = true;
+  };
+
+  const ensureDec = (codec: string, w: number, h: number): VideoDecoder | null => {
+    if (!canDecode) return null;
+    if (decoder && decoder.state === "configured") return decoder;
+    closeDec();
+    const next = new VideoDecoder({
+      output(frame) {
+        if (!ctx || opts.isRtcLive()) {
+          frame.close();
+          return;
+        }
+        if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
+        if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
+        ctx.drawImage(frame, 0, 0);
+        frame.close();
+        canvas.classList.remove("hidden");
+        opts.onFrame();
+      },
+      error(err) {
+        console.warn("[ezscreenshare] decode", err);
+      },
+    });
+    next.configure({ codec, codedWidth: w, codedHeight: h });
+    decoder = next;
+    waitingKey = true;
+    return next;
+  };
+
+  const handleVid = (kind: number, payload: Uint8Array): void => {
+    if (opts.isRtcLive()) return;
+    if (kind === VID_CFG) {
+      try {
+        const cfg = JSON.parse(new TextDecoder().decode(payload)) as {
+          codec?: string;
+          w?: number;
+          h?: number;
+        };
+        if (cfg.codec && cfg.w && cfg.h) ensureDec(cfg.codec, cfg.w, cfg.h);
+      } catch {
+        /* ignore */
+      }
       return;
     }
-    applying = true;
-    const blob =
-      data instanceof Blob
-        ? data
-        : new Blob([data as BlobPart], { type: "image/jpeg" });
-    const next = URL.createObjectURL(blob);
-    const shown = new Image();
-    shown.onload = () => {
-      if (stopped) {
-        URL.revokeObjectURL(next);
-        applying = false;
-        return;
+    if (kind === VID_JPEG) {
+      const blob = new Blob([copyAb(payload)], { type: "image/jpeg" });
+      void createImageBitmap(blob).then((bmp) => {
+        if (stopped || opts.isRtcLive() || !ctx) {
+          bmp.close();
+          return;
+        }
+        if (canvas.width !== bmp.width) canvas.width = bmp.width;
+        if (canvas.height !== bmp.height) canvas.height = bmp.height;
+        ctx.drawImage(bmp, 0, 0);
+        bmp.close();
+        canvas.classList.remove("hidden");
+        opts.onFrame();
+      });
+      return;
+    }
+    if (kind === VID_FRAME) {
+      if (payload.length < 6 || !decoder || decoder.state !== "configured") return;
+      const key = payload[0] === 1;
+      if (waitingKey && !key) return;
+      if (decoder.decodeQueueSize > 8 && !key) return;
+      const ts = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(1, true);
+      const data = payload.subarray(5);
+      try {
+        decoder.decode(
+          new EncodedVideoChunk({
+            type: key ? "key" : "delta",
+            timestamp: ts,
+            data: copyAb(data),
+          }),
+        );
+        if (key) waitingKey = false;
+      } catch (err) {
+        console.warn("[ezscreenshare] decode chunk", err);
+        waitingKey = true;
       }
-      const prev = objectUrl;
-      objectUrl = next;
-      img.src = next;
-      img.classList.remove("hidden");
-      shown.src = "";
-      if (prev && prev !== next) URL.revokeObjectURL(prev);
-      applying = false;
-      opts.onFrame();
-    };
-    shown.onerror = () => {
-      URL.revokeObjectURL(next);
-      applying = false;
-    };
-    shown.src = next;
+    }
   };
+
   const handleBuf = (buf: Uint8Array): void => {
+    const vid = parseVid(buf);
+    if (vid) {
+      handleVid(vid.kind, vid.payload);
+      return;
+    }
     if (isPcmPacket(buf)) {
       if (opts.isRtcLive()) return;
       const rate = new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getUint32(4, true);
@@ -514,36 +665,28 @@ function startWatch(
         Math.floor((buf.byteLength - 8) / 2),
       );
       opts.onPcm(rate, samples);
-      return;
     }
-    lastWs = Date.now();
-    applyJpeg(buf);
   };
-  const poll = async (): Promise<void> => {
-    if (stopped) return;
-    const skipHttp = opts.isRtcLive() || (wsOpen && Date.now() - lastWs < 900);
-    if (!skipHttp) {
-      try {
-        const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/frame`, {
-          cache: "no-store",
-          headers: { authorization: `Bearer ${watchToken}` },
-        });
-        if (res.ok) applyJpeg(await res.blob());
-      } catch {
-        /* next poll */
-      }
-    }
-    if (!stopped) timer = window.setTimeout(() => void poll(), skipHttp ? 400 : 150);
-  };
-  void poll();
+
   const ws = openFallback(`/ws/watch/${encodeURIComponent(roomId)}`, watchToken);
   ws.binaryType = "arraybuffer";
   ws.addEventListener("open", () => {
-    wsOpen = true;
-    ws.send(JSON.stringify({ t: "hello", name: nick, id: identity }));
-  });
-  ws.addEventListener("close", () => {
-    wsOpen = false;
+    void (async () => {
+      let jpeg = typeof VideoDecoder === "undefined";
+      if (!jpeg) {
+        try {
+          const probe = await VideoDecoder.isConfigSupported({
+            codec: "vp8",
+            codedWidth: 640,
+            codedHeight: 360,
+          });
+          jpeg = !probe.supported;
+        } catch {
+          jpeg = true;
+        }
+      }
+      ws.send(JSON.stringify({ t: "hello", name: nick, id: identity, jpeg }));
+    })();
   });
   const pingTimer = window.setInterval(() => {
     if (stopped || ws.readyState !== WebSocket.OPEN) return;
@@ -572,16 +715,18 @@ function startWatch(
     }
     handleBuf(new Uint8Array(ev.data as ArrayBuffer));
   });
-  return () => {
-    stopped = true;
-    window.clearTimeout(timer);
-    window.clearInterval(pingTimer);
-    img.onload = null;
-    img.onerror = null;
-    img.removeAttribute("src");
-    if (objectUrl) URL.revokeObjectURL(objectUrl);
-    objectUrl = "";
-    if (ws.readyState === WebSocket.OPEN) ws.close();
+  const setRtc = (on: boolean): void => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: "rtc", on }));
+    if (on) canvas.classList.add("hidden");
+  };
+  return {
+    setRtc,
+    stop() {
+      stopped = true;
+      window.clearInterval(pingTimer);
+      closeDec();
+      if (ws.readyState === WebSocket.OPEN) ws.close();
+    },
   };
 }
 
@@ -873,14 +1018,6 @@ function renderHost(): void {
               <option value="60">60</option>
             </select>
           </label>
-          <label class="field">compat fps
-            <select id="compatFps">
-              <option value="2">2</option>
-              <option value="5" selected>5</option>
-              <option value="8">8</option>
-              <option value="15">15</option>
-            </select>
-          </label>
           <label class="field ${isElectron ? "" : "hidden"}" id="audioSrcLiveWrap">audio source
             <select id="audioSrcLive">
               <option value="system">Entire system</option>
@@ -1121,7 +1258,6 @@ function renderHost(): void {
         }
         people();
       });
-      ingest.setFps(Number(qs<HTMLSelectElement>("#compatFps").value) || 5);
       people();
       qs("#setup").classList.add("hidden");
       qs("#live").classList.remove("hidden");
@@ -1222,9 +1358,6 @@ function renderHost(): void {
   };
   qs("#resLive").addEventListener("change", onQuality);
   qs("#fpsLive").addEventListener("change", onQuality);
-  qs("#compatFps").addEventListener("change", () => {
-    ingest?.setFps(Number(qs<HTMLSelectElement>("#compatFps").value) || 5);
-  });
   async function reattachAudio(): Promise<void> {
     if (!localStream || !room || !qs<HTMLInputElement>("#audio").checked) return;
     for (const t of localStream.getAudioTracks()) {
@@ -1294,8 +1427,8 @@ function renderViewer(roomId: string): void {
       </form>
       <div id="watch" class="hidden">
         <div class="stage">
-          <video id="remote" autoplay playsinline webkit-playsinline controls></video>
-          <img id="compat" class="compat hidden" alt="" />
+          <video id="remote" class="hidden" autoplay playsinline webkit-playsinline></video>
+          <canvas id="compat" class="compat hidden"></canvas>
         </div>
         <div class="hud">
           <span class="pill" id="status">connecting</span>
@@ -1313,10 +1446,10 @@ function renderViewer(roomId: string): void {
   const nick = qs<HTMLInputElement>("#nick");
   nick.value = localStorage.getItem(nickKey) || "";
   const video = qs<HTMLVideoElement>("#remote");
-  const compat = qs<HTMLImageElement>("#compat");
+  const compat = qs<HTMLCanvasElement>("#compat");
   const err = qs("#err");
   let room: Room | null = null;
-  let stopWatch: (() => void) | null = null;
+  let stopWatch: { stop: () => void; setRtc: (on: boolean) => void } | null = null;
   let stopPing: (() => void) | null = null;
   let rtcLive = false;
   let pcmCtx: AudioContext | null = null;
@@ -1382,8 +1515,10 @@ function renderViewer(roomId: string): void {
       rtcLive = true;
       compat.classList.add("hidden");
       video.classList.remove("hidden");
+      video.controls = true;
       showWatch();
       setStatus("live", true);
+      stopWatch?.setRtc(true);
     }
     void pub;
   }
@@ -1438,9 +1573,10 @@ function renderViewer(roomId: string): void {
       room.on(RoomEvent.ParticipantDisconnected, people);
       room.on(RoomEvent.Disconnected, () => {
         rtcLive = false;
+        stopWatch?.setRtc(false);
         if (!compat.classList.contains("hidden")) setStatus("compatibility", true);
       });
-      stopWatch?.();
+      stopWatch?.stop();
       stopPing?.();
       pingById.clear();
       pcmCtx ??= new AudioContext();
@@ -1450,7 +1586,6 @@ function renderViewer(roomId: string): void {
       video.playsInline = true;
       video.disablePictureInPicture = false;
       showWatch();
-      void video.play().catch(() => undefined);
       stopWatch = startWatch(
         compat,
         joined.roomId,
@@ -1461,6 +1596,7 @@ function renderViewer(roomId: string): void {
           isRtcLive: () => rtcLive,
           onFrame: () => {
             if (!rtcLive) {
+              video.classList.add("hidden");
               showWatch();
               setStatus("compatibility", true);
             }

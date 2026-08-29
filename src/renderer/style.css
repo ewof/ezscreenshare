@@ -146,8 +146,10 @@ input:focus, select:focus { border-color: var(--focus); }
 .source figcaption { padding: 6px 8px; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .stage { position: relative; background: var(--stage); border-radius: 12px; overflow: hidden; min-height: 240px; }
-.stage video, .stage img.compat { width: 100%; display: block; max-height: calc(100vh - 160px); background: var(--stage); object-fit: contain; }
-.stage img.compat:not(.hidden) {
+.stage video, .stage canvas.compat {
+  width: 100%; display: block; max-height: calc(100vh - 160px); background: var(--stage); object-fit: contain;
+}
+.stage canvas.compat:not(.hidden) {
   position: absolute;
   inset: 0;
   width: 100%;

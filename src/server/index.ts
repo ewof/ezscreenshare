@@ -6,7 +6,14 @@ import { fileURLToPath } from "node:url";
 import { AccessToken, RoomServiceClient } from "livekit-server-sdk";
 import { acceptWebsocket, type WsClient } from "./fallback-ws.ts";
 
-type Watcher = { ws: WsClient; name: string; id: string; rtt?: number };
+type Watcher = { ws: WsClient; name: string; id: string; rtt?: number; rtc?: boolean; jpeg?: boolean };
+
+function sendMedia(rec: RoomRecord, data: Buffer): void {
+  for (const w of rec.watchers) {
+    if (w.rtc) continue;
+    w.ws.send(data);
+  }
+}
 type RoomRecord = {
   id: string;
   passwordHash: Buffer | null;
@@ -16,7 +23,7 @@ type RoomRecord = {
   watchTokens: Map<string, number>;
   ingest: WsClient | null;
   watchers: Set<Watcher>;
-  lastFrame: Buffer | null;
+  lastInit: Buffer | null;
   gcAt: number;
 };
 
@@ -238,7 +245,12 @@ function notifyHost(rec: RoomRecord): void {
   rec.ingest?.send(
     JSON.stringify({
       t: "watchers",
-      viewers: [...rec.watchers].map((w) => ({ name: w.name, id: w.id, rtt: w.rtt })),
+      viewers: [...rec.watchers].map((w) => ({
+        name: w.name,
+        id: w.id,
+        rtt: w.rtt,
+        jpeg: w.jpeg,
+      })),
     }),
   );
 }
@@ -280,9 +292,20 @@ async function readBuffer(req: IncomingMessage, max = 1_500_000): Promise<Buffer
   return Buffer.concat(chunks);
 }
 
+function isVidCfg(data: Buffer): boolean {
+  return (
+    data.length >= 5 &&
+    data[0] === 0x45 &&
+    data[1] === 0x5a &&
+    data[2] === 0x53 &&
+    data[3] === 0x56 &&
+    data[4] === 0
+  );
+}
+
 function pushFrame(rec: RoomRecord, frame: Buffer): void {
-  rec.lastFrame = frame;
-  for (const w of rec.watchers) w.ws.send(frame);
+  if (isVidCfg(frame)) rec.lastInit = frame;
+  sendMedia(rec, frame);
 }
 
 const MIME: Record<string, string> = {
@@ -384,7 +407,7 @@ const server = createServer(async (req, res) => {
         watchTokens: new Map(),
         ingest: null,
         watchers: new Set(),
-        lastFrame: null,
+        lastInit: null,
         gcAt: 0,
       });
       try {
@@ -450,7 +473,7 @@ const server = createServer(async (req, res) => {
         json(res, 403, { error: "bad token" }, req);
         return;
       }
-      if (!rec.lastFrame) {
+      if (!rec.lastInit) {
         applyCors(req, res);
         res.writeHead(204, { "cache-control": "no-store" });
         res.end();
@@ -459,11 +482,11 @@ const server = createServer(async (req, res) => {
       applyCors(req, res);
       applySecHeaders(res);
       res.writeHead(200, {
-        "content-type": "image/jpeg",
+        "content-type": "application/octet-stream",
         "cache-control": "no-store",
-        "content-length": rec.lastFrame.length,
+        "content-length": rec.lastInit.length,
       });
-      if (req.method !== "HEAD") res.write(rec.lastFrame);
+      if (req.method !== "HEAD") res.write(rec.lastInit);
       res.end();
       return;
     }
@@ -572,7 +595,8 @@ server.on("upgrade", (req, socket, head) => {
       onMessage(data, isBinary) {
         if (!isBinary) return;
         if (data.length > 1_500_000) return;
-        for (const w of rec.watchers) w.ws.send(data);
+        if (isVidCfg(data)) rec.lastInit = data;
+        sendMedia(rec, data);
       },
       onClose() {
         if (rec.ingest === ingestWs) rec.ingest = null;
@@ -608,11 +632,16 @@ server.on("upgrade", (req, socket, head) => {
             id?: string;
             n?: number;
             ms?: number;
+            on?: boolean;
+            jpeg?: boolean;
           };
           if (msg.t === "hello") {
             if (typeof msg.name === "string") watcher.name = msg.name.trim().slice(0, 32) || watcher.name;
             if (typeof msg.id === "string") watcher.id = msg.id.trim().slice(0, 64);
+            watcher.jpeg = Boolean(msg.jpeg);
             notifyHost(rec);
+          } else if (msg.t === "rtc") {
+            watcher.rtc = Boolean(msg.on);
           } else if (msg.t === "ping") {
             watcher.ws.send(JSON.stringify({ t: "pong", n: msg.n }));
           } else if (msg.t === "rtt" && typeof msg.ms === "number" && Number.isFinite(msg.ms)) {
@@ -633,6 +662,7 @@ server.on("upgrade", (req, socket, head) => {
       watcher = { ws, name: "viewer", id: "" };
       rec.watchers.add(watcher);
       ws.send(JSON.stringify({ t: "hello", hasHost: Boolean(rec.ingest) }));
+      if (rec.lastInit) ws.send(rec.lastInit);
       notifyHost(rec);
     }
     return;

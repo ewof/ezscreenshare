@@ -9,6 +9,8 @@ export type WsClient = {
   close: () => void;
   ping: () => void;
   ready: boolean;
+  /** Kernel write buffer; media should skip when this is large. */
+  buffered: number;
 };
 
 type Handlers = {
@@ -67,10 +69,16 @@ export function acceptWebsocket(
     get ready() {
       return ready;
     },
+    get buffered() {
+      return socket.writableLength;
+    },
     send(data) {
       if (!ready) return;
-      const payload = typeof data === "string" ? Buffer.from(data) : data;
-      socket.write(encodeFrame(typeof data === "string" ? 1 : 2, payload));
+      const isString = typeof data === "string";
+      // Never queue stale JPEGs/PCM behind a slow viewer (that is the 10s lag).
+      if (!isString && socket.writableLength > 256_000) return;
+      const payload = isString ? Buffer.from(data) : data;
+      socket.write(encodeFrame(isString ? 1 : 2, payload));
     },
     ping() {
       if (ready) socket.write(encodeFrame(9, Buffer.alloc(0)));

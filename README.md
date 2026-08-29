@@ -18,7 +18,7 @@ Built for a small group that actually has to work: a Linux host, a Mac, an iPhon
 - **Viewers** get a link. Any current browser. They set a nickname and watch.
 - You can change source, resolution, and FPS without minting a new link.
 - Force TCP is on by default so media does not depend on random UDP.
-- If WebRTC cannot connect (common with locked-down Firefox + SOCKS), a JPEG + PCM path still shows the screen and plays sound. Status says `compatibility` instead of `live`. That is intentional, not a failure.
+- If WebRTC cannot connect (common with locked-down Firefox + SOCKS), a TCP fallback still shows the screen and plays sound. Status says `compatibility` instead of `live`. That is intentional, not a failure. Video is VP8 over the websocket (WebCodecs); audio is PCM on the same socket. Viewers that cannot decode VP8 get JPEG stills instead.
 
 ## What we prioritized
 
@@ -38,7 +38,7 @@ Starting a stream needs a host key. Viewer passwords stay optional. Rooms die wh
 ICE and public DNS point at the VPS, not the house.
 
 **iOS is a first-class viewer.**  
-H.264 for Safari, a player that is allowed to autoplay after you tap Join, JPEG fallback if cellular will not do WebRTC.
+H.264 for Safari, a player that is allowed to autoplay after you tap Join. If cellular will not do WebRTC, the same TCP compatibility path applies (VP8, or JPEG if the browser cannot decode it).
 
 ## Hosting
 
@@ -54,7 +54,7 @@ You need the host key from whoever runs the server. Optional viewer password is 
 
 Open the link. Nickname is stored locally. If the room has a password, enter it. On iPhone, tap Join, then tap the video if Safari left it paused.
 
-`live` is WebRTC. `compatibility` is the JPEG path. Both are valid.
+`live` is WebRTC (video and audio). `compatibility` is VP8 + PCM over the websocket, or JPEG stills if the browser has no VP8 decoder. Both are valid.
 
 ## Run it yourself
 
@@ -97,7 +97,7 @@ pnpm dist:mac    # on macOS
 | --- | --- |
 | `src/renderer` | Host + viewer UI |
 | `src/main`, `src/preload` | Electron: capture, PipeWire tap, clipboard |
-| `src/server` | Token API, rooms, JPEG/PCM fallback |
+| `src/server` | Token API, rooms, websocket fallback (VP8/PCM, JPEG if needed) |
 | `config/` | LiveKit local vs prod |
 | `deploy/` | nginx snippets for the public name |
 

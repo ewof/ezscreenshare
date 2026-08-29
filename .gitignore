@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.prod
+config/livekit.local.yaml
+config/livekit.prod.yaml
+*.log
+.DS_Store
+certs/
+turn-certs/*.pem

@@ -1,0 +1,24 @@
+# Copy to livekit.local.yaml. ICE advertised as 127.0.0.1 for local viewers.
+# keys.ezs must match LIVEKIT_API_SECRET in .env.
+port: 7880
+log_level: info
+bind_addresses:
+  - 0.0.0.0
+rtc:
+  tcp_port: 21115
+  udp_port: 21116
+  use_external_ip: false
+  node_ip: 127.0.0.1
+  allow_tcp_fallback: true
+  stun_servers: []
+  enable_loopback_candidate: true
+keys:
+  ezs: change-me-to-at-least-32-characters-long
+room:
+  empty_timeout: 300
+  departure_timeout: 20
+  auto_create: false
+turn:
+  enabled: true
+  domain: localhost
+  udp_port: 3478

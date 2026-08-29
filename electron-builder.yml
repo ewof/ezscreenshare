@@ -1,0 +1,28 @@
+appId: com.example.ezscreenshare
+productName: ezscreenshare
+copyright: FOSS
+# ESM main (src/main/electron.mjs) cannot load from asar.
+asar: false
+directories:
+  output: dist/desktop
+files:
+  - src/main/**
+  - src/preload/**
+  - package.json
+  - "!**/node_modules/**"
+extraMetadata:
+  main: src/main/electron.mjs
+linux:
+  executableName: ezscreenshare
+  category: Network
+  maintainer: ezscreenshare
+  artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+  target:
+    - dir
+    - zip
+    - AppImage
+win:
+  target: nsis
+mac:
+  target: dmg
+  category: public.app-category.video

@@ -1,0 +1,31 @@
+# Copy to livekit.prod.yaml on the LiveKit host.
+# node_ip is the public address viewers connect to (VPS), not a home WAN.
+# keys.ezs must match LIVEKIT_API_SECRET in .env.prod.
+port: 7880
+log_level: info
+bind_addresses:
+  - 127.0.0.1
+rtc:
+  tcp_port: 21115
+  udp_port: 21116
+  use_external_ip: false
+  node_ip: 203.0.113.10
+  allow_tcp_fallback: true
+  stun_servers: []
+  ips:
+    excludes:
+      - fd00::/8
+      - fe80::/10
+keys:
+  ezs: change-me-to-at-least-32-characters-long
+room:
+  empty_timeout: 600
+  departure_timeout: 30
+  auto_create: false
+turn:
+  enabled: true
+  domain: turn.example.com
+  tls_port: 21117
+  cert_file: /certs/fullchain.pem
+  key_file: /certs/privkey.pem
+  external_tls: false

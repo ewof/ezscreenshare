@@ -1,0 +1,11 @@
+# Local development. From this directory: pnpm dev
+# (starts this compose's livekit + the token API + vite).
+services:
+  livekit:
+    image: livekit/livekit-server:v1.9.1
+    container_name: ezscreenshare-livekit
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    network_mode: host
+    volumes:
+      - ./config/livekit.local.yaml:/etc/livekit.yaml:ro

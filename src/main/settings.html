@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ezscreenshare</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #2e3440;
+        --panel: #3b4252;
+        --panel-2: #434c5e;
+        --line: #4c566a;
+        --text: #eceff4;
+        --muted: #d8dee9;
+        --accent: #88c0d0;
+        --btn-text: #2e3440;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
+      body { font: 15px/1.45 "IBM Plex Sans", "Segoe UI", system-ui, sans-serif; }
+      .wrap { max-width: 520px; margin: 0 auto; padding: 48px 20px; }
+      .brand { font-weight: 700; letter-spacing: -0.03em; font-size: 20px; }
+      .brand span { color: var(--accent); }
+      .sub { color: var(--muted); font-size: 13px; margin: 6px 0 22px; }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 18px;
+      }
+      label.field { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; }
+      input {
+        font: inherit; font-size: 16px; color: var(--text);
+        background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+        padding: 8px 10px; outline: none;
+      }
+      input:focus { border-color: var(--accent); }
+      .btn {
+        margin-top: 14px; background: var(--accent); color: var(--btn-text);
+        border: 0; border-radius: 8px; padding: 9px 14px; font: inherit; font-weight: 650; cursor: pointer;
+      }
+      .err { color: #bf616a; font-size: 13px; min-height: 1.2em; margin-top: 10px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="brand">ez<span>screenshare</span></div>
+      <div class="sub">desktop host</div>
+      <div class="panel">
+        <label class="field">server
+          <input id="url" type="url" spellcheck="false" placeholder="https://share.example.com" />
+        </label>
+        <p class="sub" style="margin: 12px 0 0">Whoever runs the server gives you this URL. The host key is on the next screen.</p>
+        <div class="err" id="err"></div>
+        <button class="btn" id="go" type="button">continue</button>
+      </div>
+    </div>
+    <script>
+      const url = document.querySelector("#url");
+      const err = document.querySelector("#err");
+      const q = new URLSearchParams(location.search);
+      if (q.get("err")) err.textContent = q.get("err");
+      window.ez.getServerUrl().then((u) => {
+        if (u) url.value = u;
+      });
+      async function go() {
+        err.textContent = "";
+        try {
+          await window.ez.setServerUrl(url.value);
+        } catch (e) {
+          err.textContent = e instanceof Error ? e.message : String(e);
+        }
+      }
+      document.querySelector("#go").addEventListener("click", () => void go());
+      url.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") void go();
+      });
+    </script>
+  </body>
+</html>

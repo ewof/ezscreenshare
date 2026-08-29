@@ -1,0 +1,40 @@
+{
+  "name": "ezscreenshare",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Private share-a-link screen streamer. Host is Electron; viewers are any browser.",
+  "type": "module",
+  "main": "src/main/electron.mjs",
+  "scripts": {
+    "dev:web": "vite --config vite.config.ts",
+    "dev:api": "node --experimental-strip-types src/server/index.ts",
+    "dev": "concurrently -k -n livekit,api,web -c blue,green,magenta \"docker compose up --no-color livekit\" \"node --experimental-strip-types src/server/index.ts\" \"vite --config vite.config.ts\"",
+    "electron:dev": "wait-on -t 30000 -v http-get://127.0.0.1:8787/health http-get://127.0.0.1:5173 && ELECTRON_DEV=1 electron .",
+    "electron:prod": "electron .",
+    "build": "vite build --config vite.config.ts",
+    "start": "node --experimental-strip-types src/server/index.ts",
+    "dist:linux": "pnpm build && electron-builder --linux dir zip AppImage",
+    "install:local": "bash scripts/install-local.sh",
+    "dist:win": "pnpm build && electron-builder --win nsis",
+    "dist:mac": "pnpm build && electron-builder --mac dmg"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["electron", "esbuild"]
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "livekit-client": "^2.15.7",
+    "livekit-server-sdk": "^2.13.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "concurrently": "^9.2.1",
+    "electron": "^39.0.0",
+    "electron-builder": "^26.0.12",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5",
+    "wait-on": "^8.0.4"
+  }
+}

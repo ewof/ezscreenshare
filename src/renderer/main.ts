@@ -2,12 +2,17 @@ import {
   Room,
   RoomEvent,
   Track,
+  VideoPreset,
+  VideoQuality,
   type LocalTrackPublication,
   type RemoteTrack,
   type RemoteTrackPublication,
   type RemoteParticipant,
   type LocalVideoTrack,
   type LocalAudioTrack,
+  type RemoteVideoTrack,
+  type VideoSenderStats,
+  type VideoReceiverStats,
 } from "livekit-client";
 
 declare global {
@@ -58,6 +63,161 @@ const isElectron = Boolean(window.ez?.isElectron);
 const nickKey = "ezscreenshare.nick";
 const themeKey = "ezscreenshare.theme";
 const hostKey = "ezscreenshare.hostKey";
+const statsKey = "ezscreenshare.stats";
+const FPS_VALUES = [5, 15, 24, 25, 30, 60] as const;
+
+function fpsSelectHtml(id: string, selected = 30): string {
+  const opts = FPS_VALUES.map(
+    (f) => `<option value="${f}"${f === selected ? " selected" : ""}>${f}</option>`,
+  ).join("");
+  return `<label class="field">fps
+            <select id="${id}">${opts}</select>
+          </label>`;
+}
+
+function bitrateFor(height: number, fps: number): number {
+  const table: Record<number, Record<number, number>> = {
+    480: { 5: 350_000, 15: 500_000, 24: 700_000, 25: 700_000, 30: 700_000, 60: 1_000_000 },
+    720: { 5: 500_000, 15: 800_000, 24: 1_000_000, 25: 1_050_000, 30: 1_200_000, 60: 2_000_000 },
+    1080: { 5: 800_000, 15: 1_400_000, 24: 1_800_000, 25: 1_900_000, 30: 2_500_000, 60: 4_000_000 },
+    1440: { 5: 1_200_000, 15: 2_200_000, 24: 3_200_000, 25: 3_400_000, 30: 4_000_000, 60: 6_000_000 },
+  };
+  const row =
+    height <= 480 ? table[480]! : height <= 720 ? table[720]! : height <= 1080 ? table[1080]! : table[1440]!;
+  return row[fps] ?? row[30] ?? 1_200_000;
+}
+
+function ingestBitrate(height: number, fps: number): number {
+  return Math.min(bitrateFor(Math.min(height, 480), fps), 1_200_000);
+}
+
+function contentHintFor(fps: number): "motion" | "detail" {
+  return fps >= 24 ? "motion" : "detail";
+}
+
+function screenSharePublishOpts(height: number, fps: number) {
+  const encoding = { maxBitrate: bitrateFor(height, fps), maxFramerate: fps };
+  const lowH = Math.min(480, Math.max(180, Math.round(height / 2)));
+  const lowW = Math.round(lowH * (16 / 9));
+  return {
+    source: Track.Source.ScreenShare,
+    simulcast: height > 480,
+    videoCodec: "h264" as const,
+    backupCodec: { codec: "vp8" as const },
+    screenShareEncoding: encoding,
+    screenShareSimulcastLayers:
+      height > 480 ? [new VideoPreset(lowW, lowH, bitrateFor(lowH, fps), fps)] : undefined,
+    degradationPreference: "maintain-framerate" as RTCDegradationPreference,
+  };
+}
+
+async function applySenderQuality(
+  pub: LocalTrackPublication | null,
+  height: number,
+  fps: number,
+): Promise<void> {
+  const track = pub?.videoTrack ?? (pub?.track as LocalVideoTrack | undefined);
+  if (!track) return;
+  try {
+    await track.setDegradationPreference("maintain-framerate");
+  } catch {
+    /* older senders */
+  }
+  const sender = track.sender;
+  if (!sender) return;
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings?.length) return;
+    const n = params.encodings.length;
+    params.encodings.forEach((enc, i) => {
+      enc.maxFramerate = fps;
+      const layerH = i === n - 1 ? height : Math.max(180, Math.round(height / 2 ** (n - 1 - i)));
+      enc.maxBitrate = bitrateFor(layerH, fps);
+    });
+    (params as RTCRtpSendParameters & { degradationPreference?: RTCDegradationPreference }).degradationPreference =
+      "maintain-framerate";
+    await sender.setParameters(params);
+  } catch (e) {
+    console.warn("[ezscreenshare] setParameters", e);
+  }
+}
+
+function statsEnabled(): boolean {
+  return localStorage.getItem(statsKey) === "1";
+}
+
+function formatBitrate(bps: number): string {
+  if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(1)} Mb/s`;
+  if (bps >= 1000) return `${Math.round(bps / 1000)} kb/s`;
+  return `${Math.round(bps)} b/s`;
+}
+
+function lossLabel(lost?: number, total?: number): string {
+  if (lost == null || total == null || total <= 0) return "";
+  const p = (100 * lost) / total;
+  if (p < 0.05) return "loss 0%";
+  return `loss ${p < 1 ? p.toFixed(1) : Math.round(p)}%`;
+}
+
+function senderStatsLine(stats: VideoSenderStats[]): string | undefined {
+  if (!stats.length) return undefined;
+  const best = stats.reduce((a, b) => ((b.frameHeight || 0) > (a.frameHeight || 0) ? b : a));
+  const bits = stats.reduce((n, s) => n + (s.targetBitrate || 0), 0) || best.targetBitrate;
+  const parts = ["live"];
+  if (best.frameHeight) parts.push(`${best.frameHeight}p`);
+  if (best.framesPerSecond) parts.push(`${Math.round(best.framesPerSecond)}fps`);
+  if (bits) parts.push(formatBitrate(bits));
+  const sent = stats.reduce((n, s) => n + (s.packetsSent || 0), 0);
+  const lost = stats.reduce((n, s) => n + (s.packetsLost || 0), 0);
+  const loss = lossLabel(lost, sent + lost);
+  if (loss) parts.push(loss);
+  const reason = best.qualityLimitationReason;
+  if (reason && reason !== "none") parts.push(reason === "bandwidth" ? "bw limit" : `${reason} limit`);
+  return parts.join(" · ");
+}
+
+function receiverStatsLine(
+  stats: VideoReceiverStats | undefined,
+  bitrate?: number,
+): string | undefined {
+  if (!stats) return undefined;
+  const parts = ["live"];
+  if (stats.frameHeight) parts.push(`${stats.frameHeight}p`);
+  if (bitrate != null && Number.isFinite(bitrate) && bitrate > 0) parts.push(formatBitrate(bitrate));
+  const recv = stats.packetsReceived ?? 0;
+  const lost = stats.packetsLost ?? 0;
+  const loss = lossLabel(lost, recv + lost);
+  if (loss) parts.push(loss);
+  return parts.join(" · ");
+}
+
+function bindStatsToggle(
+  btn: HTMLElement,
+  pill: HTMLElement,
+  sample: () => Promise<string | undefined>,
+): () => void {
+  const apply = (): void => {
+    const on = statsEnabled();
+    pill.classList.toggle("hidden", !on);
+    btn.classList.toggle("stats-on", on);
+    btn.textContent = on ? "stats on" : "stats";
+    if (!on) pill.textContent = "—";
+  };
+  const tick = async (): Promise<void> => {
+    if (!statsEnabled()) return;
+    const line = await sample();
+    if (line) pill.textContent = line;
+  };
+  apply();
+  btn.addEventListener("click", () => {
+    localStorage.setItem(statsKey, statsEnabled() ? "0" : "1");
+    apply();
+    void tick();
+  });
+  const id = window.setInterval(() => void tick(), 2000);
+  void tick();
+  return () => window.clearInterval(id);
+}
 
 function currentTheme(): "dark" | "light" {
   return document.documentElement.dataset.theme === "light" ? "light" : "dark";
@@ -98,17 +258,18 @@ async function api<T>(url: string, body?: unknown): Promise<T> {
   return data;
 }
 
-function roomOpts(_kind: "host" | "viewer") {
+function roomOpts(kind: "host" | "viewer") {
   return {
     // Hidden <video> is 0×0; adaptiveStream then never requests a layer (iOS).
     adaptiveStream: false,
-    dynacast: false,
+    dynacast: kind === "host",
     publishDefaults: {
       videoCodec: "h264" as const,
       backupCodec: { codec: "vp8" as const },
       dtx: false,
-      red: false,
-      simulcast: false,
+      red: true,
+      simulcast: kind === "host",
+      degradationPreference: "maintain-framerate" as RTCDegradationPreference,
     },
     audioCaptureDefaults: {
       autoGainControl: false,
@@ -145,7 +306,7 @@ function setPingPill(el: HTMLElement | null, ms: number | undefined): void {
   el.classList.add(pingClass(ms));
 }
 
-type PersonRow = { name: string; role: string; ms?: number };
+type PersonRow = { name: string; role: string; ms?: number; path?: "live" | "compat" };
 
 function renderPeople(ul: HTMLElement, rows: PersonRow[]): void {
   ul.replaceChildren();
@@ -172,7 +333,7 @@ function renderPeople(ul: HTMLElement, rows: PersonRow[]): void {
     }
     const r = document.createElement("span");
     r.className = "sub";
-    r.textContent = row.role;
+    r.textContent = row.path ? `${row.role} · ${row.path}` : row.role;
     right.appendChild(r);
     li.append(n, right);
     ul.appendChild(li);
@@ -334,8 +495,9 @@ function startIngest(
   stream: MediaStream,
   roomId: string,
   ingestToken: string,
-  onWatchers: (viewers: { name: string; id: string; rtt?: number; jpeg?: boolean }[]) => void,
-): { stop: () => void; setStream: (s: MediaStream) => void; setFps: (fps: number) => void } {
+  onWatchers: (viewers: { name: string; id: string; rtt?: number; jpeg?: boolean; rtc?: boolean }[]) => void,
+  quality?: { fps: number; bitrate: number },
+): { stop: () => void; setStream: (s: MediaStream) => void; setQuality: (fps: number, bitrate: number) => void } {
   const ws = openFallback(`/ws/ingest/${encodeURIComponent(roomId)}`, ingestToken);
   const tap = document.createElement("video");
   tap.muted = true;
@@ -349,7 +511,8 @@ function startIngest(
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d", { alpha: false });
   let srcStream = stream;
-  let fps = 15;
+  let fps = Math.max(2, Math.min(30, quality?.fps ?? 15));
+  let bitrate = quality?.bitrate ?? 700_000;
   let drawTimer = 0;
   let frameN = 0;
   let enc: VideoEncoder | null = null;
@@ -450,7 +613,7 @@ function startIngest(
       codec: "vp8",
       width: w,
       height: h,
-      bitrate: 700_000,
+      bitrate,
       framerate: fps,
       latencyMode: "realtime",
     });
@@ -501,7 +664,7 @@ function startIngest(
       const msg = JSON.parse(ev.data) as {
         t?: string;
         names?: string[];
-        viewers?: { name: string; id: string; rtt?: number; jpeg?: boolean }[];
+        viewers?: { name: string; id: string; rtt?: number; jpeg?: boolean; rtc?: boolean }[];
       };
       if (msg.t === "watchers" && Array.isArray(msg.viewers)) {
         wantJpeg = msg.viewers.some((v) => v.jpeg);
@@ -520,8 +683,9 @@ function startIngest(
       hookAudio(next);
       closeEnc();
     },
-    setFps(next) {
-      fps = Math.max(2, Math.min(30, next));
+    setQuality(nextFps, nextBitrate) {
+      fps = Math.max(2, Math.min(30, nextFps));
+      bitrate = Math.max(120_000, nextBitrate);
       window.clearInterval(drawTimer);
       drawTimer = window.setInterval(paint, Math.round(1000 / fps));
       closeEnc();
@@ -742,7 +906,7 @@ function viewerIdentity(): string {
 
 function applyQuality(track: MediaStreamTrack, height: number, fps: number): void {
   const width = Math.round(height * (16 / 9));
-  const hint = fps >= 30 ? "motion" : "detail";
+  const hint = contentHintFor(fps);
   try {
     (track as MediaStreamTrack & { contentHint?: string }).contentHint = hint;
   } catch {
@@ -954,14 +1118,7 @@ function renderHost(): void {
               <option value="1440">1440p</option>
             </select>
           </label>
-          <label class="field">fps
-            <select id="fps">
-              <option value="5">5</option>
-              <option value="15">15</option>
-              <option value="30" selected>30</option>
-              <option value="60">60</option>
-            </select>
-          </label>
+          ${fpsSelectHtml("fps", 30)}
         </div>
         <div class="row">
           <label class="check ${isElectron ? "" : "hidden"}"><input id="audio" type="checkbox" checked /> share audio</label>
@@ -989,11 +1146,13 @@ function renderHost(): void {
         <div class="hud">
           <span class="pill live">LIVE</span>
           <span class="pill" id="ping">ping —</span>
+          <span class="pill hidden" id="stats">—</span>
           <span class="pill" id="audioState">audio ?</span>
           <div class="linkbox">
             <input id="link" class="mono" type="text" readonly />
             <button class="btn secondary" id="copy" type="button">copy link</button>
           </div>
+          <button class="btn secondary" id="statsToggle" type="button">stats</button>
           <button class="btn secondary" id="switch" type="button">change source</button>
           <button class="btn secondary" id="stop" type="button">stop</button>
         </div>
@@ -1010,14 +1169,7 @@ function renderHost(): void {
               <option value="1440">1440p</option>
             </select>
           </label>
-          <label class="field">fps
-            <select id="fpsLive">
-              <option value="5">5</option>
-              <option value="15">15</option>
-              <option value="30">30</option>
-              <option value="60">60</option>
-            </select>
-          </label>
+          ${fpsSelectHtml("fpsLive")}
           <label class="field ${isElectron ? "" : "hidden"}" id="audioSrcLiveWrap">audio source
             <select id="audioSrcLive">
               <option value="system">Entire system</option>
@@ -1044,9 +1196,10 @@ function renderHost(): void {
   let videoPub: LocalTrackPublication | null = null;
   let audioPub: LocalTrackPublication | null = null;
   let ingest: ReturnType<typeof startIngest> | null = null;
-  let fallbackWatchers: { name: string; id: string; rtt?: number }[] = [];
+  let fallbackWatchers: { name: string; id: string; rtt?: number; jpeg?: boolean; rtc?: boolean }[] = [];
   const pingById = new Map<string, number>();
   let stopPing: (() => void) | null = null;
+  let stopStats: (() => void) | null = null;
 
   async function loadSources(box: HTMLElement, onPick?: (s: Source) => void): Promise<void> {
     if (!window.ez) return;
@@ -1147,6 +1300,22 @@ function renderHost(): void {
       }
       return undefined;
     };
+    const watcherOf = (id: string, name: string) => {
+      const lower = name.toLowerCase();
+      return fallbackWatchers.find(
+        (w) => (w.id && w.id === id) || (w.name && w.name.toLowerCase() === lower),
+      );
+    };
+    const pathOf = (id: string, name: string): "live" | "compat" | undefined => {
+      if (id === "host") return undefined;
+      const w = watcherOf(id, name);
+      if (w?.jpeg) return "compat";
+      if (w?.rtc) return "live";
+      if (w && w.rtc === false) return "compat";
+      if (rtcIds.has(id)) return "live";
+      if (w) return "compat";
+      return undefined;
+    };
     for (const p of rtcPeople) {
       const you = room && p === room.localParticipant ? " (you)" : "";
       const name = p.name || p.identity;
@@ -1154,6 +1323,7 @@ function renderHost(): void {
         name: `${name}${you}`,
         role: p.identity === "host" ? "host" : "viewer",
         ms: rttOf(p.identity, name),
+        path: pathOf(p.identity, name),
       });
     }
     for (const w of fallbackWatchers) {
@@ -1163,13 +1333,14 @@ function renderHost(): void {
         name: w.name || w.id || "viewer",
         role: "viewer",
         ms: w.rtt ?? (w.id ? pingById.get(w.id) : undefined),
+        path: w.jpeg || w.rtc === false ? "compat" : w.rtc ? "live" : "compat",
       });
     }
     renderPeople(ul, rows);
     setPingPill(document.querySelector("#ping"), pingById.get("host"));
   }
 
-  async function publish(stream: MediaStream): Promise<void> {
+  async function publish(stream: MediaStream, height: number, fps: number): Promise<void> {
     if (!room) return;
     const prev = localStream;
     localStream = stream;
@@ -1186,24 +1357,17 @@ function renderHost(): void {
     const audio = stream.getAudioTracks()[0];
     if (videoPub && video) {
       await (videoPub.track as LocalVideoTrack).replaceTrack(video);
+      await applySenderQuality(videoPub, height, fps);
     } else if (video) {
-      videoPub = await room.localParticipant.publishTrack(video, {
-        source: Track.Source.ScreenShare,
-        simulcast: false,
-        videoCodec: "h264",
-        backupCodec: { codec: "vp8" },
-        videoEncoding: {
-          maxBitrate: Number(qs<HTMLSelectElement>("#res").value) >= 1080 ? 2_500_000 : 1_200_000,
-          maxFramerate: Number(qs<HTMLSelectElement>("#fps").value),
-        },
-      });
+      videoPub = await room.localParticipant.publishTrack(video, screenSharePublishOpts(height, fps));
+      await applySenderQuality(videoPub, height, fps);
     }
     if (audio) {
       if (audioPub) await (audioPub.track as LocalAudioTrack).replaceTrack(audio);
       else {
         audioPub = await room.localParticipant.publishTrack(audio, {
           source: Track.Source.ScreenShareAudio,
-          red: false,
+          red: true,
           dtx: false,
         });
       }
@@ -1249,14 +1413,31 @@ function renderHost(): void {
       stopPing?.();
       pingById.clear();
       stopPing = bindRoomPing(room, "host", pingById, () => people());
-      await publish(stream);
+      await publish(stream, height, fps);
       ingest?.stop();
-      ingest = startIngest(stream, created.roomId, created.ingestToken, (viewers) => {
-        fallbackWatchers = viewers;
-        for (const w of viewers) {
-          if (w.id && w.rtt != null) pingById.set(w.id, w.rtt);
+      ingest = startIngest(
+        stream,
+        created.roomId,
+        created.ingestToken,
+        (viewers) => {
+          fallbackWatchers = viewers;
+          for (const w of viewers) {
+            if (w.id && w.rtt != null) pingById.set(w.id, w.rtt);
+          }
+          people();
+        },
+        { fps, bitrate: ingestBitrate(height, fps) },
+      );
+      stopStats?.();
+      stopStats = bindStatsToggle(qs("#statsToggle"), qs("#stats"), async () => {
+        const track = videoPub?.videoTrack ?? (videoPub?.track as LocalVideoTrack | undefined);
+        if (!track) return undefined;
+        try {
+          const stats = await track.getSenderStats();
+          return senderStatsLine(Array.isArray(stats) ? stats : stats ? [stats] : []);
+        } catch {
+          return undefined;
         }
-        people();
       });
       people();
       qs("#setup").classList.add("hidden");
@@ -1274,6 +1455,8 @@ function renderHost(): void {
   async function stop(): Promise<void> {
     stopPing?.();
     stopPing = null;
+    stopStats?.();
+    stopStats = null;
     pingById.clear();
     ingest?.stop();
     ingest = null;
@@ -1317,8 +1500,9 @@ function renderHost(): void {
       try {
         localStream?.getAudioTracks().forEach((t) => t.stop());
         const stream = await getStream({ audio, height, fps });
-        await publish(stream);
+        await publish(stream, height, fps);
         ingest?.setStream(stream);
+        ingest?.setQuality(fps, ingestBitrate(height, fps));
       } catch (e) {
         err.textContent = e instanceof Error ? e.message : String(e);
       }
@@ -1337,8 +1521,9 @@ function renderHost(): void {
               localStream?.removeTrack(t);
             });
             const stream = await getStream({ sourceId: s.id, audio, height, fps });
-            await publish(stream);
+            await publish(stream, height, fps);
             ingest?.setStream(stream);
+            ingest?.setQuality(fps, ingestBitrate(height, fps));
             if (audio && stream.getAudioTracks().length === 0) await reattachAudio();
             panel.classList.add("hidden");
           } catch (e) {
@@ -1355,6 +1540,8 @@ function renderHost(): void {
     const fps = Number(qs<HTMLSelectElement>("#fpsLive").value);
     const video = localStream?.getVideoTracks()[0];
     if (video) applyQuality(video, height, fps);
+    ingest?.setQuality(fps, ingestBitrate(height, fps));
+    void applySenderQuality(videoPub, height, fps);
   };
   qs("#resLive").addEventListener("change", onQuality);
   qs("#fpsLive").addEventListener("change", onQuality);
@@ -1373,7 +1560,7 @@ function renderHost(): void {
       else {
         audioPub = await room.localParticipant.publishTrack(audio, {
           source: Track.Source.ScreenShareAudio,
-          red: false,
+          red: true,
           dtx: false,
         });
       }
@@ -1433,6 +1620,15 @@ function renderViewer(roomId: string): void {
         <div class="hud">
           <span class="pill" id="status">connecting</span>
           <span class="pill" id="ping">ping —</span>
+          <span class="pill hidden" id="stats">—</span>
+          <label class="field">quality
+            <select id="vq">
+              <option value="auto" selected>auto</option>
+              <option value="low">480</option>
+              <option value="high">full</option>
+            </select>
+          </label>
+          <button class="btn secondary" id="statsToggle" type="button">stats</button>
         </div>
         <div class="panel people-panel">
           <div class="sub">connected</div>
@@ -1451,12 +1647,50 @@ function renderViewer(roomId: string): void {
   let room: Room | null = null;
   let stopWatch: { stop: () => void; setRtc: (on: boolean) => void } | null = null;
   let stopPing: (() => void) | null = null;
+  let stopStats: (() => void) | null = null;
+  let hostVideoPub: RemoteTrackPublication | null = null;
   let rtcLive = false;
   let pcmCtx: AudioContext | null = null;
   let pcmGain: GainNode | null = null;
   let pcmAt = 0;
   const pingById = new Map<string, number>();
   const selfId = viewerIdentity();
+  let recvBytes = 0;
+  let recvAt = 0;
+
+  qs("#vq").addEventListener("change", () => applyViewerQuality());
+  new ResizeObserver(() => {
+    if ((document.querySelector<HTMLSelectElement>("#vq")?.value ?? "auto") === "auto") {
+      applyViewerQuality();
+    }
+  }).observe(video);
+  stopStats = bindStatsToggle(qs("#statsToggle"), qs("#stats"), async () => {
+    if (rtcLive && hostVideoPub?.videoTrack) {
+      try {
+        const stats = await (hostVideoPub.videoTrack as RemoteVideoTrack).getReceiverStats();
+        const now = performance.now();
+        let br: number | undefined;
+        if (stats?.bytesReceived != null && recvAt) {
+          const dt = (now - recvAt) / 1000;
+          if (dt > 0) br = ((stats.bytesReceived - recvBytes) * 8) / dt;
+        }
+        if (stats?.bytesReceived != null) {
+          recvBytes = stats.bytesReceived;
+          recvAt = now;
+        }
+        const line = receiverStatsLine(stats, br);
+        const fps = hostVideoPub.videoTrack.mediaStreamTrack.getSettings().frameRate;
+        if (line && fps) return line.replace("live", `live · ${Math.round(fps)}fps`);
+        return line;
+      } catch {
+        return undefined;
+      }
+    }
+    if (!compat.classList.contains("hidden") && compat.width > 1) {
+      return `compat · ${compat.height}p`;
+    }
+    return undefined;
+  });
 
   function people(): void {
     const ul = document.querySelector<HTMLElement>("#people");
@@ -1464,12 +1698,28 @@ function renderViewer(roomId: string): void {
     const rtcPeople = room
       ? [room.localParticipant, ...Array.from(room.remoteParticipants.values())]
       : [];
+    const selfPath: "live" | "compat" | undefined = rtcLive
+      ? "live"
+      : !compat.classList.contains("hidden")
+        ? "compat"
+        : undefined;
     const rows: PersonRow[] = rtcPeople.map((p) => {
       const you = room && p === room.localParticipant ? " (you)" : "";
+      const isYou = Boolean(you);
       return {
         name: `${p.name || p.identity}${you}`,
         role: p.identity === "host" ? "host" : "viewer",
-        ms: pingById.get(p.identity),
+        ms: pingById.get(isYou ? selfId : p.identity) ?? pingById.get(p.identity),
+        path:
+          p.identity === "host"
+            ? rtcLive
+              ? "live"
+              : selfPath === "compat"
+                ? "compat"
+                : undefined
+            : isYou
+              ? selfPath
+              : "live",
       };
     });
     if (!rows.length) {
@@ -1478,6 +1728,7 @@ function renderViewer(roomId: string): void {
         name: `${n} (you)`,
         role: "viewer",
         ms: pingById.get(selfId),
+        path: selfPath,
       });
     }
     renderPeople(ul, rows);
@@ -1512,6 +1763,7 @@ function renderViewer(roomId: string): void {
       }
     }
     if (track.kind === Track.Kind.Video) {
+      hostVideoPub = pub;
       rtcLive = true;
       compat.classList.add("hidden");
       video.classList.remove("hidden");
@@ -1519,8 +1771,24 @@ function renderViewer(roomId: string): void {
       showWatch();
       setStatus("live", true);
       stopWatch?.setRtc(true);
+      applyViewerQuality();
     }
-    void pub;
+  }
+
+  function applyViewerQuality(): void {
+    if (!hostVideoPub) return;
+    const mode = document.querySelector<HTMLSelectElement>("#vq")?.value ?? "auto";
+    try {
+      if (mode === "low") hostVideoPub.setVideoQuality(VideoQuality.LOW);
+      else if (mode === "high") hostVideoPub.setVideoQuality(VideoQuality.HIGH);
+      else {
+        const w = Math.max(320, video.clientWidth || 1280);
+        const h = Math.max(180, video.clientHeight || 720);
+        hostVideoPub.setVideoDimensions({ width: w, height: h });
+      }
+    } catch {
+      /* publication not ready */
+    }
   }
 
   function sliderGain(): number {
@@ -1599,6 +1867,7 @@ function renderViewer(roomId: string): void {
               video.classList.add("hidden");
               showWatch();
               setStatus("compatibility", true);
+              people();
             }
           },
           onPcm: playPcm,

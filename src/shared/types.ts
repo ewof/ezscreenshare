@@ -1,6 +1,6 @@
 export type QualityPreset = {
   height: 480 | 720 | 1080 | 1440;
-  fps: 5 | 15 | 30 | 60;
+  fps: 5 | 15 | 24 | 25 | 30 | 60;
 };
 
 export type IceInfo = {

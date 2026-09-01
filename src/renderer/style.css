@@ -164,6 +164,9 @@ input:focus, select:focus { border-color: var(--focus); }
   padding: 4px 10px; font-size: 12px; color: var(--muted);
 }
 .pill.live { color: #eceff4; background: var(--live); border-color: transparent; }
+.pill.stats { font-variant-numeric: tabular-nums; }
+.btn.stats-on { border-color: var(--accent); color: var(--accent); }
+.hud label.field { min-width: 88px; flex: 0 0 auto; }
 .linkbox { display: flex; gap: 8px; flex: 1; min-width: 200px; }
 .linkbox input { flex: 1; }
 

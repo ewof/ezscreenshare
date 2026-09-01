@@ -250,6 +250,7 @@ function notifyHost(rec: RoomRecord): void {
         id: w.id,
         rtt: w.rtt,
         jpeg: w.jpeg,
+        rtc: Boolean(w.rtc),
       })),
     }),
   );

@@ -51,7 +51,11 @@ On macOS 13+, the desktop app captures application audio through ScreenCaptureKi
 
 Allow **Screen & System Audio Recording** in macOS System Settings, then quit and reopen the host. When launched from a terminal, macOS may attribute permission to the terminal (such as iTerm) instead. Permission denial is shown as a capture error. Protected content and windows macOS does not expose cannot be captured.
 
-On Windows, “Entire system” uses native loopback audio. Per-application selection is available on Linux and macOS. The Windows fix requires the updated Electron main/preload files, not just a refreshed webpage.
+On Windows, choose multiple applications or leave “Entire system” checked and uncheck apps to exclude them. Native WASAPI capture works independently of the selected screen/window and leaves local playback alone. The list shows apps with an audio session, including paused players; play something once if an app is missing, then refresh the sources. Selection is saved by executable name and follows restarted apps. Filtered capture mixes the permitted application sessions; Windows notification sounds are included only in unfiltered “Entire system” capture. Application capture is not gated by the reported Windows build number: it also works on updated Windows 10 systems reporting build 19044. If the native API is unavailable, whole-system capture remains available through Electron loopback. Restart the desktop app after updating its main/preload files, and deploy the updated web interface too.
+
+The audio picker has a search field. Click anywhere on an application row to select or deselect it; its checkmark is on the right. Search only filters the list and does not change your selection. The setup form scrolls vertically when its contents do not fit.
+
+Host settings are remembered on this device for each server: nickname, host key, viewer password, resolution, FPS, audio sharing, force TCP, and viewer-list visibility. Changes are saved as you edit, including resolution/FPS changes during a stream. Clear the viewer password field to save streams without a viewer password again. Audio selections, theme, and stats visibility are also remembered.
 
 After an update, restart the desktop host and hard-refresh browser hosts and viewers. Already-open host pages continue running their old encoder until reloaded.
 
@@ -101,7 +105,7 @@ pnpm dist:win    # on Windows
 pnpm dist:mac    # on macOS (requires Xcode Command Line Tools)
 ```
 
-For a source checkout on macOS, `pnpm electron:prod` restores a missing Electron runtime and builds the native helper before opening the app. Install Xcode Command Line Tools (`xcode-select --install`) if Swift is unavailable. Packaged apps include the helper and do not need developer tools. The helper is built for the current machine’s architecture. The production app loads its interface from the saved server URL, so deploy the updated `dist/web` and restart the desktop app together.
+For a source checkout, `pnpm electron:prod` restores a missing Electron runtime and builds the platform's native helper before opening the app. Windows uses the included .NET Framework compiler (no Visual Studio installation needed); the helper runs as x64, including under Windows ARM64 emulation. On macOS, install Xcode Command Line Tools (`xcode-select --install`) if Swift is unavailable. Packaged apps include the helper and do not need developer tools. The production app loads its interface from the saved server URL, so deploy the updated `dist/web` and restart the desktop app together.
 
 ## Checks
 
@@ -110,6 +114,7 @@ pnpm test
 pnpm check
 pnpm build
 pnpm test:mac  # optional macOS hardware test; plays two quiet test tones
+pnpm test:win  # Windows hardware test; plays two quiet tones and checks isolation/mixing
 ```
 
 Compatibility playback uses a bounded jitter buffer and reports stalls to the host so it can reduce video bitrate on a slow path. WebRTC audio and video use the same stream group and receiver buffering target where supported. Actual long-distance latency still depends on the route and available bandwidth.

@@ -4,6 +4,17 @@ contextBridge.exposeInMainWorld("ez", {
   isElectron: true,
   platform: process.platform,
   audioSelectionVersion: 1,
+  beginWindowsAudio: process.platform === "win32"
+    ? (selection) => ipcRenderer.invoke("ez:beginWindowsAudio", selection) : undefined,
+  onWindowsAudio: (callback) => {
+    const data = (_event, packet) => callback(packet);
+    ipcRenderer.on("ez:windowsAudioData", data);
+    ipcRenderer.on("ez:windowsAudioError", data);
+    return () => {
+      ipcRenderer.removeListener("ez:windowsAudioData", data);
+      ipcRenderer.removeListener("ez:windowsAudioError", data);
+    };
+  },
   beginMacAudio: (selection) => ipcRenderer.invoke("ez:beginMacAudio", selection),
   onMacAudio: (callback) => {
     const data = (_event, packet) => callback(packet);

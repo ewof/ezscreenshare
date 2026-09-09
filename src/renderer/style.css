@@ -42,13 +42,16 @@
   --stage: #2e3440;
 }
 
-* { box-sizing: border-box; }
+* { box-sizing: border-box; scrollbar-color: var(--line) var(--bg); }
 html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); }
 body {
   font: 15px/1.45 "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
 }
 button, input, select { font: inherit; color: inherit; }
 button { cursor: pointer; }
+input[type="checkbox"] { accent-color: var(--accent); }
+input::placeholder { color: var(--muted); opacity: 1; }
+::selection { background: var(--accent); color: var(--btn-text); }
 code, .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
 
 #app { height: 100%; }
@@ -106,11 +109,12 @@ input:focus, select:focus { border-color: var(--focus); }
   min-height: 0;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
+#setup > * { flex-shrink: 0; }
 #sourceWrap {
-  flex: 1;
-  min-height: 0;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   margin-top: 4px;
@@ -125,9 +129,6 @@ input:focus, select:focus { border-color: var(--focus); }
   gap: 10px;
 }
 #sourceWrap .sources {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
   padding-right: 2px;
 }
 #live:not(.hidden) {
@@ -155,7 +156,7 @@ input:focus, select:focus { border-color: var(--focus); }
   width: 100%;
   height: 100%;
   border-radius: 0;
-  background: #000;
+  background: var(--stage);
 }
 .stage:fullscreen video,
 .stage:fullscreen canvas,
@@ -270,10 +271,24 @@ input:focus, select:focus { border-color: var(--focus); }
 input[type="range"] { accent-color: var(--accent); width: 140px; }
 
 .hidden { display: none !important; }
-.audio-picker { position: relative; min-width: 260px; max-width: 420px; }
-.audio-picker summary { padding: 9px 12px; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
-.audio-options { display: flex; flex-direction: column; gap: 8px; max-height: 260px; overflow-y: auto; padding: 12px; border: 1px solid var(--line); border-radius: 6px; }
-.audio-options label { cursor: pointer; overflow-wrap: anywhere; }
+#audioSrcRow > .field, #audioSrcLiveWrap { width: 100%; min-width: 0; }
+.audio-picker { position: relative; width: 100%; min-width: 0; color: var(--text); }
+.audio-picker summary { padding: 11px 14px; border: 1px solid var(--line); border-radius: 9px; cursor: pointer; background: var(--bg); overflow-wrap: anywhere; }
+.audio-picker[open] summary { border-color: var(--accent); }
+.audio-menu { margin-top: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }
+.audio-search { width: 100%; padding: 10px 12px; margin-bottom: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); outline-offset: 2px; }
+.audio-options { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; }
+.audio-option { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 24px; min-height: 46px; padding: 10px 12px; border: 1px solid transparent; border-radius: 7px; cursor: pointer; font-size: 14px; }
+.audio-option[hidden] { display: none; }
+.audio-option:hover { background: var(--panel); }
+.audio-option:has(input:checked) { background: var(--panel-2); }
+.audio-option:focus-within { border-color: var(--focus); outline: 1px solid var(--focus); outline-offset: -2px; }
+.audio-option-name { min-width: 0; overflow-wrap: anywhere; text-align: left; }
+.audio-option-name small { display: block; margin-top: 2px; font-size: 12px; color: var(--muted); }
+.audio-option input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.audio-checkmark { display: grid; place-items: center; flex: 0 0 21px; height: 21px; border: 1px solid var(--line); border-radius: 5px; color: transparent; font-weight: 700; }
+.audio-option input:checked + .audio-checkmark { background: var(--accent); border-color: var(--accent); color: var(--btn-text); }
+.audio-empty { margin: 12px; color: var(--muted); font-size: 13px; }
 .live-sources { margin-top: 12px; }
 /* JPEG fallback needs a decoding <video>; keep it out of layout. Inline
    style="" is blocked by style-src 'self'. */

@@ -49,6 +49,12 @@ app.commandLine.appendSwitch("ozone-platform-hint", "auto");
 app.commandLine.appendSwitch("enable-features", "WebRTCPipeWireCapturer,LoopbackWaveIn");
 
 let macAudio;
+let windowsAudio;
+function getWindowsAudio() {
+  return windowsAudio ??= new MacAudio(app.isPackaged
+    ? join(process.resourcesPath, "native/windows-audio.exe")
+    : join(here, "../../dist/native/windows-audio.exe"), "Windows", "windowsAudio");
+}
 function getMacAudio() {
   return macAudio ??= new MacAudio(app.isPackaged
     ? join(process.resourcesPath, "native/macos-audio")
@@ -300,6 +306,7 @@ async function refreshAudioRouting() {
 
 async function teardownTap() {
   macAudio?.stop();
+  windowsAudio?.stop();
   if (process.platform !== "linux") return;
   clearInterval(audioRoutingTimer);
   audioRoutingTimer = null;
@@ -383,6 +390,10 @@ async function ensureVirt(masterMonitor) {
 }
 
 ipcMain.handle("ez:listAudioSources", async () => {
+  if (process.platform === "win32") return [
+    { id: "system", label: "Entire system", monitor: true, running: true },
+    ...(await getWindowsAudio().list()),
+  ];
   if (process.platform === "darwin") return [
     { id: "system", label: "Entire system", monitor: true, running: true },
     ...(await getMacAudio().list()).sort((a, b) => a.label.localeCompare(b.label)),
@@ -447,6 +458,12 @@ ipcMain.handle("ez:beginMacAudio", (event, selection) => {
   if (process.platform !== "darwin") throw new Error("macOS audio is unavailable on this platform.");
   armMedia();
   return getMacAudio().start(selection, event.sender);
+});
+
+ipcMain.handle("ez:beginWindowsAudio", (event, selection) => {
+  if (process.platform !== "win32") throw new Error("Windows audio is unavailable on this platform.");
+  armMedia();
+  return getWindowsAudio().start(selection, event.sender);
 });
 
 ipcMain.handle("ez:endMonitorCapture", async () => {
@@ -559,6 +576,7 @@ app.whenReady().then(async () => {
 
 let finishingQuit = false;
 app.on("before-quit", (event) => {
+  windowsAudio?.dispose();
   if (process.platform === "darwin") {
     // Native capture needs no routing restoration. Cancel pending discovery or
     // capture immediately; never defer macOS quit behind the audio queue.

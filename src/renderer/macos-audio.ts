@@ -8,7 +8,10 @@ export async function startMacAudio(stream: MediaStream, wanted: AudioSelection,
   stopMacAudio();
   const currentGeneration = ++generation;
   const bridge = window.ez;
-  if (!bridge?.beginMacAudio || !bridge.onMacAudio) throw new Error("Restart the updated desktop app to enable macOS audio.");
+  const windows = bridge?.platform === "win32";
+  const begin = windows ? bridge?.beginWindowsAudio : bridge?.beginMacAudio;
+  const subscribe = windows ? bridge?.onWindowsAudio : bridge?.onMacAudio;
+  if (!begin || !subscribe) throw new Error("Restart the updated desktop app to enable application audio.");
   const context = new AudioContext({ sampleRate: 48000 });
   let unsubscribe: (() => void) | undefined;
   let node: AudioWorkletNode | undefined;
@@ -33,7 +36,7 @@ export async function startMacAudio(stream: MediaStream, wanted: AudioSelection,
     await context.resume();
     if (cleaned) throw new Error("Audio capture was stopped.");
     let sessionId = -1;
-    unsubscribe = bridge.onMacAudio(packet => {
+    unsubscribe = subscribe(packet => {
       if (packet.id !== sessionId || cleaned) return;
       if (packet.error) {
         console.error("[ezscreenshare]", packet.error);
@@ -47,9 +50,9 @@ export async function startMacAudio(stream: MediaStream, wanted: AudioSelection,
         node!.port.postMessage(samples, [samples.buffer]);
       }
     });
-    const session = await bridge.beginMacAudio(wanted);
+    const session = await begin(wanted);
     if (cleaned) throw new Error("Audio capture was stopped.");
-    if (!session.ok) throw new Error("macOS did not start audio capture.");
+    if (!session.ok) throw new Error("Native audio capture did not start.");
     sessionId = session.id;
     track = destination.stream.getAudioTracks()[0];
     track.contentHint = "music";
@@ -57,7 +60,7 @@ export async function startMacAudio(stream: MediaStream, wanted: AudioSelection,
     return session.label;
   } catch (error) {
     cleanup();
-    if (currentGeneration === generation) await bridge.releaseAudioTap();
+    if (currentGeneration === generation) await bridge?.releaseAudioTap();
     throw error;
   }
 }

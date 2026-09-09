@@ -26,6 +26,8 @@ declare global {
       isElectron: true;
       platform?: string;
       audioSelectionVersion?: number;
+      beginWindowsAudio?: (selection: AudioSelection) => Promise<{ ok: boolean; id: number; label: string }>;
+      onWindowsAudio?: (callback: (packet: { id: number; bytes?: Uint8Array; error?: string }) => void) => () => void;
       beginMacAudio?: (selection: AudioSelection) => Promise<{ ok: boolean; id: number; label: string }>;
       onMacAudio?: (callback: (packet: { id: number; bytes?: Uint8Array; error?: string }) => void) => () => void;
       setCaptureAudio?: (on: boolean) => Promise<void>;
@@ -2065,11 +2067,15 @@ async function getStream(opts: {
   if (isElectron && window.ez && opts.sourceId) {
     await window.ez.setCapture(opts.sourceId, opts.audio);
   }
-  const windowsLoopback = isElectron && desktopPlatform() === "win32";
   const selection = readAudioSelection();
-  if (windowsLoopback && selection.apps.length) throw new Error("This Windows build supports Entire system audio only; clear the application selection first.");
+  const windowsLoopback = isElectron && desktopPlatform() === "win32" && (!selection.apps.length || !window.ez?.beginWindowsAudio);
+  if (opts.audio && windowsLoopback && selection.apps.length) throw new Error("Restart the updated desktop app to select Windows audio applications.");
   const wantsAudio = opts.audio && !(isElectron && selection.mode === "include" && !selection.apps.length);
-  if (windowsLoopback) await window.ez?.setCaptureAudio?.(wantsAudio);
+  if (windowsLoopback) {
+    stopMacAudio();
+    await window.ez?.releaseAudioTap();
+    await window.ez?.setCaptureAudio?.(wantsAudio);
+  }
   const display: DisplayMediaStreamOptions = {
     video: {
       frameRate: { ideal: opts.fps },
@@ -2135,7 +2141,7 @@ async function addSystemAudio(stream: MediaStream): Promise<void> {
     await window.ez?.releaseAudioTap();
     return;
   }
-  if (desktopPlatform() === "darwin") {
+  if (desktopPlatform() === "darwin" || (desktopPlatform() === "win32" && wanted.apps.length > 0 && window.ez?.beginWindowsAudio)) {
     lastAudioLabel = await startMacAudio(stream, wanted, error => {
       const status = document.querySelector("#audioState");
       if (status) status.textContent = error;
@@ -2143,7 +2149,8 @@ async function addSystemAudio(stream: MediaStream): Promise<void> {
     return;
   }
   if (desktopPlatform() === "win32") {
-    if (wanted.apps.length) throw new Error("This Windows build supports Entire system audio only.");
+    if (wanted.apps.length) throw new Error("Restart the updated desktop app to select Windows audio applications.");
+    await window.ez?.releaseAudioTap();
     await window.ez?.setCaptureAudio?.(true);
     const extra = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: constraints });
     extra.getVideoTracks().forEach(track => track.stop());
@@ -2264,7 +2271,7 @@ function renderHost(): void {
         </div>
         <div class="row ${isElectron ? "" : "hidden"}" id="audioSrcRow">
           <div class="field">audio sources
-            <details class="audio-picker" id="audioSrc"><summary>Entire system</summary><div class="audio-options"></div></details>
+            <details class="audio-picker" id="audioSrc"><summary>Entire system</summary><div class="audio-menu"><input class="audio-search" type="search" placeholder="Search audio sources…" aria-label="Search audio sources" /><div class="audio-options"></div><p class="audio-empty hidden" role="status">No matching sources</p></div></details>
           </div>
         </div>
         <div id="sourceWrap" class="${isElectron ? "" : "hidden"}">
@@ -2294,9 +2301,11 @@ function renderHost(): void {
             <label class="check"><input id="showViewersLive" type="checkbox" checked /> viewers see who's watching</label>
             <button class="btn secondary" id="statsToggle" type="button">stats</button>
             <button class="btn secondary" id="switch" type="button">change source</button>
+            <button class="btn secondary ${isElectron ? "" : "hidden"}" id="refreshLive" type="button">refresh sources</button>
             <button class="btn secondary" id="stop" type="button">stop</button>
           </div>
         </div>
+        <div class="err" id="liveErr" role="status"></div>
         <div id="liveSources" class="live-sources hidden">
           <p class="sub">pick a source</p>
           <div id="liveSourceGrid" class="sources"></div>
@@ -2312,7 +2321,7 @@ function renderHost(): void {
           </label>
           ${fpsSelectHtml("fpsLive")}
           <div class="field ${isElectron ? "" : "hidden"}" id="audioSrcLiveWrap">audio sources
-            <details class="audio-picker" id="audioSrcLive"><summary>Entire system</summary><div class="audio-options"></div></details>
+            <details class="audio-picker" id="audioSrcLive"><summary>Entire system</summary><div class="audio-menu"><input class="audio-search" type="search" placeholder="Search audio sources…" aria-label="Search audio sources" /><div class="audio-options"></div><p class="audio-empty hidden" role="status">No matching sources</p></div></details>
           </div>
         </div>
         <div class="panel people-panel">
@@ -2332,7 +2341,32 @@ function renderHost(): void {
   showViewersSetup.checked = localStorage.getItem(showViewersKey) !== "0";
   showViewersLive.checked = showViewersSetup.checked;
   hostKeyInput.value = localStorage.getItem(hostKey) || "";
+  const resolutionInput = qs<HTMLSelectElement>("#res");
+  const fpsInput = qs<HTMLSelectElement>("#fps");
+  const viewerPasswordInput = qs<HTMLInputElement>("#password");
+  const audioInput = qs<HTMLInputElement>("#audio");
+  const tcpInput = qs<HTMLInputElement>("#tcp");
+  for (const [input, key] of [[resolutionInput, "resolution"], [fpsInput, "fps"]] as const) {
+    const saved = localStorage.getItem(`ezscreenshare.${key}`);
+    if (saved && [...input.options].some(option => option.value === saved)) input.value = saved;
+  }
+  viewerPasswordInput.value = localStorage.getItem("ezscreenshare.viewerPassword") || "";
+  audioInput.checked = localStorage.getItem("ezscreenshare.shareAudio") !== "0";
+  tcpInput.checked = localStorage.getItem("ezscreenshare.forceTcp") !== "0";
+  function saveHostSettings(): void {
+    localStorage.setItem(nickKey, nick.value.trim() || "host");
+    localStorage.setItem(hostKey, hostKeyInput.value);
+    localStorage.setItem("ezscreenshare.resolution", resolutionInput.value);
+    localStorage.setItem("ezscreenshare.fps", fpsInput.value);
+    localStorage.setItem("ezscreenshare.viewerPassword", viewerPasswordInput.value);
+    localStorage.setItem("ezscreenshare.shareAudio", audioInput.checked ? "1" : "0");
+    localStorage.setItem("ezscreenshare.forceTcp", tcpInput.checked ? "1" : "0");
+    localStorage.setItem(showViewersKey, showViewersSetup.checked ? "1" : "0");
+  }
+  qs("#setup").addEventListener("input", saveHostSettings);
+  qs("#setup").addEventListener("change", saveHostSettings);
   const err = qs("#err");
+  const liveErr = qs("#liveErr");
   let selected: Source | null = null;
   let room: Room | null = null;
   let localStream: MediaStream | null = null;
@@ -2344,13 +2378,13 @@ function renderHost(): void {
   let stopPing: (() => void) | null = null;
   let stopStats: (() => void) | null = null;
 
-  async function loadSources(box: HTMLElement, onPick?: (s: Source) => void): Promise<void> {
+  async function loadSources(box: HTMLElement, onPick?: (s: Source) => void, errorTarget = err): Promise<void> {
     if (!window.ez) return;
     let sources: Source[] = [];
     try {
       sources = await window.ez.getSources();
     } catch (e) {
-      err.textContent = e instanceof Error ? e.message : String(e);
+      errorTarget.textContent = e instanceof Error ? e.message : String(e);
       return;
     }
     box.innerHTML = "";
@@ -2387,6 +2421,16 @@ function renderHost(): void {
   void loadSources(qs("#sources"));
 
   let audioSourceOptions: { id: string; label: string }[] = [];
+  function filterAudioPicker(root: HTMLElement): void {
+    const query = root.querySelector<HTMLInputElement>(".audio-search")!.value.trim().toLocaleLowerCase();
+    let matches = 0;
+    for (const row of root.querySelectorAll<HTMLElement>(".audio-option")) {
+      const show = (row.textContent || "").toLocaleLowerCase().includes(query);
+      row.hidden = !show;
+      if (show) matches++;
+    }
+    root.querySelector(".audio-empty")!.classList.toggle("hidden", matches > 0);
+  }
   function drawAudioPickers(): void {
     const selection = readAudioSelection();
     const apps = audioSourceOptions.filter(source => source.id.startsWith("app:"));
@@ -2400,16 +2444,29 @@ function renderHost(): void {
       });
       const list = root.querySelector(".audio-options")!;
       list.replaceChildren();
-      for (const source of [{ id: "system", label: desktopPlatform() !== "win32" ? "Entire system (uncheck apps to exclude)" : "Entire system" }, ...apps]) {
+      for (const source of [{ id: "system", label: "Entire system" }, ...apps]) {
         const label = document.createElement("label");
-        label.className = "check";
+        label.className = "audio-option";
         const input = document.createElement("input");
         input.type = "checkbox";
         input.dataset.audioSource = source.id;
         input.checked = source.id === "system" ? selection.mode === "exclude" : includesAudioApp(selection, source.id.slice(4));
-        label.append(input, document.createTextNode(source.label));
+        const name = document.createElement("span");
+        name.className = "audio-option-name";
+        name.textContent = source.label;
+        if (source.id === "system") {
+          const hint = document.createElement("small");
+          hint.textContent = "Uncheck apps below to exclude them";
+          name.append(hint);
+        }
+        const mark = document.createElement("span");
+        mark.className = "audio-checkmark";
+        mark.setAttribute("aria-hidden", "true");
+        mark.textContent = "✓";
+        label.append(name, input, mark);
         list.append(label);
       }
+      filterAudioPicker(root);
     }
   }
   let audioRefreshGeneration = 0;
@@ -2457,10 +2514,19 @@ function renderHost(): void {
 
   if (isElectron) void fillAudioSelects().catch(error => { err.textContent = String(error.message || error); });
   qs("#audio").addEventListener("change", syncAudioRow);
+  syncAudioRow();
   for (const id of ["audioSrc", "audioSrcLive"]) {
     const picker = qs<HTMLDetailsElement>(`#${id}`);
+    picker.querySelector(".audio-search")!.addEventListener("input", () => filterAudioPicker(picker));
+    picker.addEventListener("keydown", event => {
+      if (event.key === "Escape") { picker.open = false; picker.querySelector("summary")!.focus(); }
+    });
     picker.addEventListener("change", changeAudioSelection);
-    picker.addEventListener("toggle", () => { if (picker.open) void fillAudioSelects().catch(error => { err.textContent = String(error.message || error); }); });
+    picker.addEventListener("toggle", () => {
+      if (!picker.open) return;
+      picker.querySelector<HTMLInputElement>(".audio-search")!.focus();
+      void fillAudioSelects().catch(error => { err.textContent = String(error.message || error); });
+    });
   }
 
   function people(): void {
@@ -2577,8 +2643,7 @@ function renderHost(): void {
 
   async function start(): Promise<void> {
     err.textContent = "";
-    localStorage.setItem(nickKey, nick.value.trim() || "host");
-    localStorage.setItem(hostKey, hostKeyInput.value);
+    saveHostSettings();
     const height = Number(qs<HTMLSelectElement>("#res").value);
     const fps = Number(qs<HTMLSelectElement>("#fps").value);
     const audio = qs<HTMLInputElement>("#audio").checked;
@@ -2703,52 +2768,54 @@ function renderHost(): void {
       btn.classList.remove("copied");
     }, 1600);
   });
-  qs("#switch").addEventListener("click", async () => {
+  async function switchLiveSource(source?: Source): Promise<void> {
     const height = Number(qs<HTMLSelectElement>("#resLive").value);
     const fps = Number(qs<HTMLSelectElement>("#fpsLive").value);
     const audio = qs<HTMLInputElement>("#audio").checked;
-    if (!isElectron) {
-      try {
-        localStream?.getAudioTracks().forEach((t) => t.stop());
-        const stream = await getStream({ audio, height, fps });
-        await publish(stream, height, fps);
-        ingest?.setStream(stream);
-        ingest?.setQuality(fps, ingestBitrate(height, fps));
-      } catch (e) {
-        err.textContent = e instanceof Error ? e.message : String(e);
-      }
-      return;
+    liveErr.textContent = "";
+    try {
+      localStream?.getAudioTracks().forEach((track) => {
+        track.stop();
+        localStream?.removeTrack(track);
+      });
+      const stream = await getStream({ sourceId: source?.id, audio, height, fps });
+      await publish(stream, height, fps);
+      ingest?.setStream(stream);
+      ingest?.setQuality(fps, ingestBitrate(height, fps));
+      if (isElectron && audio && stream.getAudioTracks().length === 0) await reattachAudio();
+      qs("#liveSources").classList.add("hidden");
+    } catch (e) {
+      liveErr.textContent = e instanceof Error ? e.message : String(e);
     }
+  }
+  function loadLiveSources(): Promise<void> {
+    return loadSources(qs("#liveSourceGrid"), source => { void switchLiveSource(source); }, liveErr);
+  }
+  qs("#switch").addEventListener("click", async () => {
+    if (!isElectron) { await switchLiveSource(); return; }
     const panel = qs("#liveSources");
     const showing = panel.classList.contains("hidden");
     panel.classList.toggle("hidden", !showing);
-    if (!showing) return;
+    if (showing) await loadLiveSources();
+  });
+  qs<HTMLButtonElement>("#refreshLive").addEventListener("click", async () => {
+    const button = qs<HTMLButtonElement>("#refreshLive");
+    button.disabled = true;
+    liveErr.textContent = "";
     try {
-      await loadSources(qs("#liveSourceGrid"), (s) => {
-        void (async () => {
-          try {
-            localStream?.getAudioTracks().forEach((t) => {
-              t.stop();
-              localStream?.removeTrack(t);
-            });
-            const stream = await getStream({ sourceId: s.id, audio, height, fps });
-            await publish(stream, height, fps);
-            ingest?.setStream(stream);
-            ingest?.setQuality(fps, ingestBitrate(height, fps));
-            if (audio && stream.getAudioTracks().length === 0) await reattachAudio();
-            panel.classList.add("hidden");
-          } catch (e) {
-            err.textContent = e instanceof Error ? e.message : String(e);
-          }
-        })();
-      });
-    } catch (e) {
-      err.textContent = e instanceof Error ? e.message : String(e);
+      await Promise.all([loadLiveSources(), fillAudioSelects()]);
+    } catch (error) {
+      liveErr.textContent = error instanceof Error ? error.message : String(error);
+    } finally {
+      button.disabled = false;
     }
   });
   const onQuality = () => {
     const height = Number(qs<HTMLSelectElement>("#resLive").value);
     const fps = Number(qs<HTMLSelectElement>("#fpsLive").value);
+    resolutionInput.value = String(height);
+    fpsInput.value = String(fps);
+    saveHostSettings();
     const video = localStream?.getVideoTracks()[0];
     if (video) applyQuality(video, height, fps);
     ingest?.setQuality(fps, ingestBitrate(height, fps));

@@ -24,6 +24,9 @@ linux:
     - AppImage
 win:
   target: nsis
+  extraResources:
+    - from: dist/native/windows-audio.exe
+      to: native/windows-audio.exe
 mac:
   target: dmg
   category: public.app-category.video

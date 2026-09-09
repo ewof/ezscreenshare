@@ -3,10 +3,13 @@ import { createInterface } from 'node:readline';
 import { normalizeAudioSelection, audioSelectionLabel } from '../shared/audio-selection.mjs';
 
 export class MacAudio {
-  constructor(binary) { this.binary = binary; this.active = null; this.sequence = 0; this.labels = new Map(); this.children = new Set(); }
+  constructor(binary, platform = 'macOS', channel = 'macAudio') {
+    this.binary = binary; this.platform = platform; this.channel = channel;
+    this.active = null; this.sequence = 0; this.labels = new Map(); this.children = new Set();
+  }
 
   launch(argument, onMessage, onExit) {
-    const child = spawn(this.binary, [argument], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(this.binary, [argument], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     this.children.add(child);
     child.once('close', () => this.children.delete(child));
     let error = '';
@@ -17,13 +20,13 @@ export class MacAudio {
       catch (err) { onMessage({ error: `Invalid native audio response: ${err.message}` }); }
     });
     child.once('error', err => onExit(err));
-    child.once('exit', code => { lines.close(); onExit(new Error(error || `macOS audio helper stopped (${code}).`)); });
+    child.once('close', code => { lines.close(); onExit(new Error(error || `${this.platform} audio helper stopped (${code}).`)); });
     return child;
   }
 
   async list() {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { child.kill(); reject(new Error('macOS audio source discovery timed out. Check Screen & System Audio Recording permission.')); }, 30000);
+      const timer = setTimeout(() => { child.kill(); reject(new Error(`${this.platform} audio source discovery timed out.`)); }, 30000);
       const child = this.launch('list', message => {
         if (message.error) { clearTimeout(timer); child.kill(); reject(new Error(message.error)); }
         if (message.sources) {
@@ -61,10 +64,10 @@ export class MacAudio {
         clearTimeout(timer);
         if (this.active?.id !== id) { reject(error); return; }
         this.stop();
-        if (ready && !sender.isDestroyed()) sender.send('ez:macAudioError', { id, error: error.message });
+        if (ready && !sender.isDestroyed()) sender.send(`ez:${this.channel}Error`, { id, error: error.message });
         reject(error);
       };
-      const timer = setTimeout(() => fail(new Error('macOS audio capture timed out. Check Screen & System Audio Recording permission.')), 30000);
+      const timer = setTimeout(() => fail(new Error(`${this.platform} audio capture timed out.`)), 30000);
       const child = this.launch(JSON.stringify(wanted), message => {
         if (this.active?.id !== id) return;
         if (message.error) return fail(new Error(message.error));
@@ -75,7 +78,7 @@ export class MacAudio {
         }
         if (ready && message.pcm && !sender.isDestroyed()) {
           const bytes = Buffer.from(message.pcm, 'base64');
-          if (bytes.length && bytes.length <= 384000 && bytes.length % 8 === 0) sender.send('ez:macAudioData', { id, bytes });
+          if (bytes.length && bytes.length <= 384000 && bytes.length % 8 === 0) sender.send(`ez:${this.channel}Data`, { id, bytes });
         }
       }, fail);
       this.active = { id, child };

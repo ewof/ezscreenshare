@@ -1,6 +1,10 @@
+import { LiveBuffer } from "./live-buffer";
+import { normalizeAudioSelection, includesAudioApp, audioSelectionLabel, type AudioSelection } from "../shared/audio-selection.mjs";
+import compatAudioUrl from "./compat-audio.worklet.js?url&no-inline";
 import {
   Room,
   RoomEvent,
+  ConnectionState,
   Track,
   VideoPreset,
   VideoQuality,
@@ -19,6 +23,9 @@ declare global {
   interface Window {
     ez?: {
       isElectron: true;
+      platform?: string;
+      audioSelectionVersion?: number;
+      setCaptureAudio?: (on: boolean) => Promise<void>;
       getSources: () => Promise<Source[]>;
       setCapture: (id: string, audio: boolean) => Promise<void>;
       monitorHint: () => Promise<string>;
@@ -27,7 +34,7 @@ declare global {
         { id: string; label: string; monitor: boolean; running: boolean }[]
       >;
       beginMonitorCapture: (
-        sourceId: string,
+        sourceId: string | AudioSelection,
       ) => Promise<{ ok: boolean; prev: string; label: string; hints?: string[] }>;
       endMonitorCapture: (prev: string) => Promise<void>;
       releaseAudioTap: () => Promise<void>;
@@ -45,6 +52,7 @@ type CreateResp = {
   forceTcp: boolean;
   iceServers: { urls: string[]; username?: string; credential?: string }[];
   ingestToken: string;
+  showViewers: boolean;
 };
 
 type JoinResp = {
@@ -54,6 +62,7 @@ type JoinResp = {
   forceTcp: boolean;
   iceServers: { urls: string[]; username?: string; credential?: string }[];
   watchToken: string;
+  showViewers?: boolean;
 };
 
 const app = document.querySelector("#app")!;
@@ -64,6 +73,7 @@ const nickKey = "ezscreenshare.nick";
 const themeKey = "ezscreenshare.theme";
 const hostKey = "ezscreenshare.hostKey";
 const statsKey = "ezscreenshare.stats";
+const showViewersKey = "ezscreenshare.showViewers";
 const FPS_VALUES = [5, 15, 24, 25, 30, 60] as const;
 
 function fpsSelectHtml(id: string, selected = 30): string {
@@ -88,7 +98,7 @@ function bitrateFor(height: number, fps: number): number {
 }
 
 function ingestBitrate(height: number, fps: number): number {
-  return Math.min(bitrateFor(Math.min(height, 480), fps), 1_200_000);
+  return Math.min(bitrateFor(height, fps), 4_000_000);
 }
 
 function contentHintFor(fps: number): "motion" | "detail" {
@@ -101,6 +111,7 @@ function screenSharePublishOpts(height: number, fps: number) {
   const lowW = Math.round(lowH * (16 / 9));
   return {
     source: Track.Source.ScreenShare,
+    stream: "screenshare",
     simulcast: height > 480,
     videoCodec: "h264" as const,
     backupCodec: { codec: "vp8" as const },
@@ -307,6 +318,15 @@ function setPingPill(el: HTMLElement | null, ms: number | undefined): void {
 }
 
 type PersonRow = { name: string; role: string; ms?: number; path?: "live" | "compat" };
+type CompatWatcher = {
+  name: string;
+  id: string;
+  rtt?: number;
+  jpeg?: boolean;
+  mse?: boolean;
+  pcm?: boolean;
+  rtc?: boolean;
+};
 
 function renderPeople(ul: HTMLElement, rows: PersonRow[]): void {
   ul.replaceChildren();
@@ -445,16 +465,146 @@ function openFallback(path: string, token: string): WebSocket {
   return new WebSocket(fallbackUrl(path), ["ezs", token]);
 }
 
-const PCM_MAGIC = [0x45, 0x5a, 0x53, 0x41]; // EZSA
+const PCM_MAGIC = [0x45, 0x5a, 0x53, 0x41]; // EZSA (legacy; ignored)
+const OPUS_MAGIC = [0x45, 0x5a, 0x53, 0x4f]; // EZSO
 const VID_MAGIC = [0x45, 0x5a, 0x53, 0x56]; // EZSV
 const VID_CFG = 0;
 const VID_FRAME = 3;
 const VID_JPEG = 5;
+const WEB_MAGIC = [0x45, 0x5a, 0x53, 0x57]; // EZSW
+const WEB_CFG = 0;
+const WEB_CHUNK = 1;
+const WEB_ACFG = 2;
+const WEB_ACHUNK = 3;
+const OPUS_CFG = 0;
+const OPUS_FRAME = 1;
+const OPUS_BITRATE = 64_000;
 
 function copyAb(u8: Uint8Array): ArrayBuffer {
   const out = new ArrayBuffer(u8.byteLength);
   new Uint8Array(out).set(u8);
   return out;
+}
+
+async function canDecodeOpus(): Promise<boolean> {
+  if (typeof AudioDecoder === "undefined") return false;
+  const cfg: AudioDecoderConfig = { codec: "opus", sampleRate: 48000, numberOfChannels: 1 };
+  try {
+    if (typeof AudioDecoder.isConfigSupported === "function") {
+      const probe = await AudioDecoder.isConfigSupported(cfg);
+      if (probe.supported) return true;
+    }
+  } catch {
+    /* continue */
+  }
+  try {
+    const dec = new AudioDecoder({
+      output(frame) {
+        frame.close();
+      },
+      error() {},
+    });
+    dec.configure(cfg);
+    const ok = dec.state === "configured";
+    dec.close();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+function packPcm(rate: number, samples: Int16Array): Uint8Array {
+  const out = new Uint8Array(8 + samples.byteLength);
+  out[0] = PCM_MAGIC[0]!;
+  out[1] = PCM_MAGIC[1]!;
+  out[2] = PCM_MAGIC[2]!;
+  out[3] = PCM_MAGIC[3]!;
+  new DataView(out.buffer).setUint32(4, rate, true);
+  out.set(new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength), 8);
+  return out;
+}
+
+async function pickCompatVideo(): Promise<"webcodecs" | "mse" | "jpeg"> {
+  const mseType = 'video/webm; codecs="vp8"';
+  const mseOk =
+    typeof MediaSource !== "undefined" &&
+    (MediaSource.isTypeSupported(mseType) || MediaSource.isTypeSupported("video/webm;codecs=vp8"));
+  const cfgs: VideoDecoderConfig[] = [
+    { codec: "vp8", codedWidth: 640, codedHeight: 360 },
+    { codec: "vp8" },
+    { codec: "vp08.00.10.08", codedWidth: 640, codedHeight: 360 },
+  ];
+  if (typeof VideoDecoder !== "undefined") {
+    for (const cfg of cfgs) {
+      try {
+        if (typeof VideoDecoder.isConfigSupported === "function") {
+          const probe = await VideoDecoder.isConfigSupported(cfg);
+          if (probe.supported) return "webcodecs";
+        }
+      } catch {
+        /* continue */
+      }
+      try {
+        const dec = new VideoDecoder({
+          output(frame) {
+            frame.close();
+          },
+          error() {},
+        });
+        dec.configure(cfg);
+        const ok = dec.state === "configured";
+        dec.close();
+        if (ok) return "webcodecs";
+      } catch {
+        /* no WebCodecs VP8 */
+      }
+    }
+  }
+  if (mseOk) return "mse";
+  return "jpeg";
+}
+
+function packWeb(kind: number, payload: Uint8Array): Uint8Array {
+  const out = new Uint8Array(5 + payload.length);
+  out[0] = WEB_MAGIC[0]!;
+  out[1] = WEB_MAGIC[1]!;
+  out[2] = WEB_MAGIC[2]!;
+  out[3] = WEB_MAGIC[3]!;
+  out[4] = kind;
+  out.set(payload, 5);
+  return out;
+}
+
+function parseWeb(buf: Uint8Array): { kind: number; payload: Uint8Array } | null {
+  if (
+    buf.length < 6 ||
+    buf[0] !== WEB_MAGIC[0] ||
+    buf[1] !== WEB_MAGIC[1] ||
+    buf[2] !== WEB_MAGIC[2] ||
+    buf[3] !== WEB_MAGIC[3]
+  ) {
+    return null;
+  }
+  return { kind: buf[4]!, payload: buf.subarray(5) };
+}
+
+function isEbml(u8: Uint8Array): boolean {
+  return u8.length >= 4 && u8[0] === 0x1a && u8[1] === 0x45 && u8[2] === 0xdf && u8[3] === 0xa3;
+}
+
+function webmCluster(u8: Uint8Array): Uint8Array | null {
+  for (let i = 0; i <= u8.length - 4; i++) {
+    if (u8[i] === 0x1f && u8[i + 1] === 0x43 && u8[i + 2] === 0xb6 && u8[i + 3] === 0x75) {
+      return u8.subarray(i);
+    }
+  }
+  return null;
+}
+
+function webmMedia(u8: Uint8Array, keepInit: boolean): Uint8Array | null {
+  if (!isEbml(u8)) return u8;
+  if (keepInit) return u8;
+  return webmCluster(u8);
 }
 
 function packVid(kind: number, payload: Uint8Array): Uint8Array {
@@ -491,13 +641,55 @@ function isPcmPacket(buf: Uint8Array): boolean {
   );
 }
 
+function packOpus(kind: number, payload: Uint8Array): Uint8Array {
+  const out = new Uint8Array(5 + payload.length);
+  out[0] = OPUS_MAGIC[0]!;
+  out[1] = OPUS_MAGIC[1]!;
+  out[2] = OPUS_MAGIC[2]!;
+  out[3] = OPUS_MAGIC[3]!;
+  out[4] = kind;
+  out.set(payload, 5);
+  return out;
+}
+
+function parseOpus(buf: Uint8Array): { kind: number; payload: Uint8Array } | null {
+  if (
+    buf.length < 6 ||
+    buf[0] !== OPUS_MAGIC[0] ||
+    buf[1] !== OPUS_MAGIC[1] ||
+    buf[2] !== OPUS_MAGIC[2] ||
+    buf[3] !== OPUS_MAGIC[3]
+  ) {
+    return null;
+  }
+  return { kind: buf[4]!, payload: buf.subarray(5) };
+}
+
+function u8ToB64(u8: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]!);
+  return btoa(s);
+}
+
+function b64ToU8(s: string): Uint8Array {
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 function startIngest(
   stream: MediaStream,
   roomId: string,
   ingestToken: string,
-  onWatchers: (viewers: { name: string; id: string; rtt?: number; jpeg?: boolean; rtc?: boolean }[]) => void,
+  onWatchers: (viewers: CompatWatcher[]) => void,
   quality?: { fps: number; bitrate: number },
-): { stop: () => void; setStream: (s: MediaStream) => void; setQuality: (fps: number, bitrate: number) => void } {
+): {
+  stop: () => void;
+  setStream: (s: MediaStream) => void;
+  setQuality: (fps: number, bitrate: number) => void;
+  setViewersVisible: (on: boolean) => void;
+} {
   const ws = openFallback(`/ws/ingest/${encodeURIComponent(roomId)}`, ingestToken);
   const tap = document.createElement("video");
   tap.muted = true;
@@ -513,17 +705,42 @@ function startIngest(
   let srcStream = stream;
   let fps = Math.max(2, Math.min(30, quality?.fps ?? 15));
   let bitrate = quality?.bitrate ?? 700_000;
+  let webmRateScale = 1;
+  let webmQualityAt = performance.now();
+  const playbackHealth = new Map<string, { at: number; stalls: number }>();
   let drawTimer = 0;
   let frameN = 0;
   let enc: VideoEncoder | null = null;
   let encW = 0;
   let encH = 0;
+  let recW = 0;
+  let recH = 0;
+  let recGen = 0;
+  let webmMime = "video/webm;codecs=vp8";
+  let webmCfgSent = false;
+  let recorder: MediaRecorder | null = null;
+  let recStream: MediaStream | null = null;
+  let arecorder: MediaRecorder | null = null;
+  let arecGen = 0;
+  let awebmMime = "audio/webm;codecs=opus";
+  let awebmCfgSent = false;
   let wantJpeg = false;
+  let wantPcm = false;
+  let wantRaw = true;
+  let mseWatchers = 0;
+  let recAudioTracks: MediaStreamTrack[] = [];
+  let recRestartAt = 0;
+  let audioGeneration = 0;
+  let audioModule: Promise<void> | null = null;
   let jpegBusy = false;
   let ac: AudioContext | null = null;
   let audioSrc: MediaStreamAudioSourceNode | null = null;
-  let audioProc: ScriptProcessorNode | null = null;
+  let audioProc: AudioWorkletNode | null = null;
   let audioMute: GainNode | null = null;
+  let aenc: AudioEncoder | null = null;
+  let audioTs = 0;
+  let opusCfgSent = false;
+  let lastOpusCfg: Uint8Array | null = null;
   const utf8 = new TextEncoder();
 
   const bindVideo = (s: MediaStream): void => {
@@ -531,7 +748,20 @@ function startIngest(
     void tap.play().catch(() => undefined);
   };
 
+  const closeAudioEnc = (): void => {
+    try {
+      aenc?.close();
+    } catch {
+      /* ignore */
+    }
+    aenc = null;
+    opusCfgSent = false;
+    lastOpusCfg = null;
+  };
+
   const unhookAudio = (): void => {
+    audioGeneration++;
+    if (audioProc) audioProc.port.onmessage = null;
     try {
       audioSrc?.disconnect();
       audioProc?.disconnect();
@@ -542,41 +772,132 @@ function startIngest(
     audioSrc = null;
     audioProc = null;
     audioMute = null;
+    closeAudioEnc();
+    stopAudioRec();
+  };
+
+  const sendOpusCfg = (cfg: {
+    codec: string;
+    sampleRate: number;
+    numberOfChannels: number;
+    description?: Uint8Array;
+  }): void => {
+    const body: { codec: string; sampleRate: number; channels: number; description?: string } = {
+      codec: cfg.codec,
+      sampleRate: cfg.sampleRate,
+      channels: cfg.numberOfChannels,
+    };
+    if (cfg.description && cfg.description.byteLength) body.description = u8ToB64(cfg.description);
+    lastOpusCfg = packOpus(OPUS_CFG, utf8.encode(JSON.stringify(body)));
+    ws.send(lastOpusCfg);
+    opusCfgSent = true;
+  };
+
+  const ensureAudioEnc = (sampleRate: number): AudioEncoder | null => {
+    if (typeof AudioEncoder === "undefined") return null;
+    if (aenc && aenc.state === "configured") return aenc;
+    closeAudioEnc();
+    const next = new AudioEncoder({
+      output(chunk, meta) {
+        if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 256_000) return;
+        const desc = meta?.decoderConfig?.description;
+        const data = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(data);
+        if (desc && !opusCfgSent) {
+          const u8 = desc instanceof Uint8Array ? desc : new Uint8Array(desc as ArrayBuffer);
+          sendOpusCfg({
+            codec: meta.decoderConfig?.codec || "opus",
+            sampleRate: meta.decoderConfig?.sampleRate || sampleRate,
+            numberOfChannels: meta.decoderConfig?.numberOfChannels || 1,
+            description: u8,
+          });
+        } else if (!opusCfgSent) {
+          sendOpusCfg({ codec: "opus", sampleRate, numberOfChannels: 1 });
+        }
+        const payload = new Uint8Array(5 + data.length);
+        payload[0] = chunk.type === "key" ? 1 : 0;
+        new DataView(payload.buffer).setUint32(1, chunk.timestamp >>> 0, true);
+        payload.set(data, 5);
+        ws.send(packOpus(OPUS_FRAME, payload));
+      },
+      error(err) {
+        console.warn("[ezscreenshare] opus encode", err);
+      },
+    });
+    next.configure({
+      codec: "opus",
+      numberOfChannels: 1,
+      sampleRate,
+      bitrate: OPUS_BITRATE,
+    });
+    aenc = next;
+    return next;
+  };
+
+  const restartRec = (): void => {
+    const now = performance.now();
+    if (recRestartAt !== 0 && now - recRestartAt < 4000) return;
+    recRestartAt = now;
+    stopRec();
   };
 
   const hookAudio = (s: MediaStream): void => {
     unhookAudio();
+    const generation = audioGeneration;
     const tracks = s.getAudioTracks();
     if (!tracks.length) return;
-    ac ??= new AudioContext();
+    ac ??= new AudioContext({ sampleRate: 48000 });
     void ac.resume();
-    const src = ac.createMediaStreamSource(new MediaStream(tracks));
-    const proc = ac.createScriptProcessor(2048, 1, 1);
-    const mute = ac.createGain();
-    mute.gain.value = 0;
-    src.connect(proc);
-    proc.connect(mute);
-    mute.connect(ac.createMediaStreamDestination());
-    proc.onaudioprocess = (ev) => {
-      if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 256_000) return;
-      const input = ev.inputBuffer.getChannelData(0);
-      const pcm = new Int16Array(input.length);
-      for (let i = 0; i < input.length; i++) {
-        const n = Math.max(-1, Math.min(1, input[i]!));
-        pcm[i] = n < 0 ? n * 0x8000 : n * 0x7fff;
-      }
-      const out = new Uint8Array(8 + pcm.byteLength);
-      out[0] = PCM_MAGIC[0]!;
-      out[1] = PCM_MAGIC[1]!;
-      out[2] = PCM_MAGIC[2]!;
-      out[3] = PCM_MAGIC[3]!;
-      new DataView(out.buffer).setUint32(4, ac!.sampleRate, true);
-      out.set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), 8);
-      ws.send(out);
-    };
-    audioSrc = src;
-    audioProc = proc;
-    audioMute = mute;
+    audioTs = 0;
+    const rate = ac.sampleRate || 48000;
+    ensureAudioEnc(rate);
+    audioModule ??= ac.audioWorklet.addModule(compatAudioUrl);
+    void audioModule.then(() => {
+      if (generation !== audioGeneration) return;
+      const src = ac!.createMediaStreamSource(new MediaStream(tracks));
+      const proc = new AudioWorkletNode(ac!, "compat-capture", { outputChannelCount: [1] });
+      const mute = ac!.createGain();
+      mute.gain.value = 0;
+      src.connect(proc);
+      proc.connect(mute);
+      mute.connect(ac!.destination);
+      proc.port.onmessage = (ev: MessageEvent<Float32Array>) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        const input = ev.data;
+        if (wantPcm && ws.bufferedAmount <= 256_000) {
+          const pcm = new Int16Array(input.length);
+          for (let i = 0; i < input.length; i++) {
+            const n = Math.max(-1, Math.min(1, input[i]!));
+            pcm[i] = n < 0 ? n * 0x8000 : n * 0x7fff;
+          }
+          ws.send(packPcm(ac!.sampleRate, pcm));
+        }
+        if (!wantRaw || ws.bufferedAmount > 256_000) return;
+        const encoder = ensureAudioEnc(rate);
+        if (encoder && encoder.encodeQueueSize < 8) {
+          const copy = new Float32Array(input);
+          const frames = copy.length;
+          const ad = new AudioData({
+            format: "f32",
+            sampleRate: rate,
+            numberOfFrames: frames,
+            numberOfChannels: 1,
+            timestamp: audioTs,
+            data: copy,
+          });
+          audioTs += Math.round((frames * 1_000_000) / rate);
+          try {
+            encoder.encode(ad);
+          } catch (err) {
+            console.warn("[ezscreenshare] opus frame", err);
+          }
+          ad.close();
+        }
+      };
+      audioSrc = src;
+      audioProc = proc;
+      audioMute = mute;
+    }).catch((err) => console.error("[ezscreenshare] audio capture", err));
   };
 
   const closeEnc = (): void => {
@@ -590,13 +911,125 @@ function startIngest(
     encH = 0;
   };
 
+  const stopRec = (): void => {
+    recGen++;
+    try {
+      if (recorder && recorder.state !== "inactive") recorder.stop();
+    } catch {
+      /* ignore */
+    }
+    recorder = null;
+    recStream?.getVideoTracks().forEach((t) => t.stop());
+    recStream = null;
+    recW = 0;
+    recH = 0;
+    webmCfgSent = false;
+  };
+
+  const ensureRec = (w: number, h: number): void => {
+    if (typeof MediaRecorder === "undefined" || w < 16 || h < 16) return;
+    if (recorder && recorder.state !== "inactive" && recW === w && recH === h) return;
+    if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 256_000) return;
+    stopRec();
+    const mime = ["video/webm;codecs=vp8", "video/webm"].find((t) => MediaRecorder.isTypeSupported(t));
+    if (!mime) return;
+    const gen = recGen;
+    webmMime = mime;
+    recW = w;
+    recH = h;
+    // Encode the capture track directly. A hidden video -> timer -> canvas
+    // pipeline can stop producing frames when the host tab is occluded.
+    recStream = new MediaStream(srcStream.getVideoTracks().map((track) => track.clone()));
+    const recBitrate = Math.min(4_000_000, Math.max(bitrate * webmRateScale, 350_000));
+    try {
+      const options: MediaRecorderOptions & { videoKeyFrameIntervalDuration: number } = {
+        mimeType: mime, videoBitsPerSecond: recBitrate, videoKeyFrameIntervalDuration: 500,
+      };
+      recorder = new MediaRecorder(recStream, options);
+    } catch {
+      recorder = new MediaRecorder(recStream, { mimeType: mime });
+    }
+    recorder.ondataavailable = (ev) => {
+      if (gen !== recGen) return;
+      if (!ev.data || ev.data.size < 16) return;
+      if (ws.readyState !== WebSocket.OPEN) return;
+      if (ws.bufferedAmount > 256_000) {
+        // Chunks are byte ranges, not independent frames. Restart with a fresh
+        // header after congestion instead of punching holes in the WebM file.
+        stopRec();
+        return;
+      }
+      if (!webmCfgSent) {
+        ws.send(packWeb(WEB_CFG, utf8.encode(JSON.stringify({ mime: webmMime, w: recW, h: recH, pipeline: "capture-track-v1", fps }))));
+        webmCfgSent = true;
+      }
+      void ev.data.arrayBuffer().then((ab) => {
+        if (gen !== recGen || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(packWeb(WEB_CHUNK, new Uint8Array(ab)));
+      });
+    };
+    recorder.start(100);
+  };
+
+  const stopAudioRec = (): void => {
+    arecGen++;
+    try {
+      if (arecorder && arecorder.state !== "inactive") arecorder.stop();
+    } catch {
+      /* ignore */
+    }
+    arecorder = null;
+    awebmCfgSent = false;
+    recAudioTracks.forEach((t) => t.stop());
+    recAudioTracks = [];
+  };
+
+  const ensureAudioRec = (s: MediaStream): void => {
+    const tracks = s.getAudioTracks().filter((t) => t.readyState === "live");
+    if (!tracks.length || typeof MediaRecorder === "undefined") {
+      stopAudioRec();
+      return;
+    }
+    if (arecorder && arecorder.state !== "inactive") return;
+    stopAudioRec();
+    const mime = ["audio/webm;codecs=opus", "audio/webm"].find((t) => MediaRecorder.isTypeSupported(t));
+    if (!mime) return;
+    const gen = arecGen;
+    awebmMime = mime;
+    recAudioTracks = tracks.map((t) => t.clone());
+    let rec: MediaRecorder;
+    try {
+      rec = new MediaRecorder(new MediaStream(recAudioTracks), {
+        mimeType: mime,
+        audioBitsPerSecond: 64_000,
+      });
+    } catch {
+      rec = new MediaRecorder(new MediaStream(recAudioTracks), { mimeType: mime });
+    }
+    rec.ondataavailable = (ev) => {
+      if (gen !== arecGen) return;
+      if (!ev.data || ev.data.size < 16) return;
+      if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 1_500_000) return;
+      if (!awebmCfgSent) {
+        ws.send(packWeb(WEB_ACFG, utf8.encode(JSON.stringify({ mime: awebmMime }))));
+        awebmCfgSent = true;
+      }
+      void ev.data.arrayBuffer().then((ab) => {
+        if (gen !== arecGen || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(packWeb(WEB_ACHUNK, new Uint8Array(ab)));
+      });
+    };
+    rec.start(1000);
+    arecorder = rec;
+  };
+
   const ensureEnc = (w: number, h: number): VideoEncoder | null => {
     if (typeof VideoEncoder === "undefined") return null;
     if (enc && encW === w && encH === h && enc.state === "configured") return enc;
     closeEnc();
     const next = new VideoEncoder({
       output(chunk) {
-        if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 256_000) return;
+        if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 1_500_000) return;
         const data = new Uint8Array(chunk.byteLength);
         chunk.copyTo(data);
         const payload = new Uint8Array(5 + data.length);
@@ -625,20 +1058,27 @@ function startIngest(
   };
 
   const paint = (): void => {
-    if (!ctx || tap.videoWidth < 2) return;
-    const scale = tap.videoWidth > 854 ? 854 / tap.videoWidth : 1;
+    const settings = srcStream.getVideoTracks()[0]?.getSettings();
+    if (mseWatchers > 0) ensureRec(settings?.width || 1280, settings?.height || 720);
+    else if (recorder) stopRec();
+    if ((!wantRaw && !wantJpeg) || !ctx || tap.videoWidth < 2) return;
+    const scale = Math.min(1, 1280 / tap.videoWidth, 720 / tap.videoHeight);
     const w = Math.max(2, Math.round(tap.videoWidth * scale) & ~1);
     const h = Math.max(2, Math.round(tap.videoHeight * scale) & ~1);
     if (canvas.width !== w) canvas.width = w;
     if (canvas.height !== h) canvas.height = h;
     ctx.drawImage(tap, 0, 0, w, h);
-    const encoder = ensureEnc(w, h);
-    if (encoder && encoder.encodeQueueSize < 4) {
-      const ts = Math.round((frameN * 1_000_000) / fps);
-      const vf = new VideoFrame(canvas, { timestamp: ts });
-      encoder.encode(vf, { keyFrame: frameN % 10 === 0 });
-      vf.close();
-      frameN++;
+    if (wantRaw) {
+      const encoder = ensureEnc(w, h);
+      if (encoder && encoder.encodeQueueSize < 4) {
+        const ts = Math.round((frameN * 1_000_000) / fps);
+        const vf = new VideoFrame(canvas, { timestamp: ts });
+        encoder.encode(vf, { keyFrame: frameN % 10 === 0 });
+        vf.close();
+        frameN++;
+      }
+    } else if (enc) {
+      closeEnc();
     }
     if (wantJpeg && !jpegBusy && ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 128_000) {
       jpegBusy = true;
@@ -664,13 +1104,44 @@ function startIngest(
       const msg = JSON.parse(ev.data) as {
         t?: string;
         names?: string[];
-        viewers?: { name: string; id: string; rtt?: number; jpeg?: boolean; rtc?: boolean }[];
+        viewers?: CompatWatcher[];
+        id?: string;
+        stalls?: number;
       };
+      if (msg.t === "playback" && msg.id && typeof msg.stalls === "number") {
+        const now = performance.now();
+        playbackHealth.set(msg.id, { at: now, stalls: msg.stalls });
+        for (const [id, health] of playbackHealth) if (now - health.at > 20_000) playbackHealth.delete(id);
+        const stalled = [...playbackHealth.values()].some(health => health.stalls >= 2);
+        const calm = [...playbackHealth.values()].every(health => health.stalls === 0);
+        const next = stalled && now - webmQualityAt > 15_000 ? Math.max(0.3, webmRateScale * 0.8)
+          : calm && now - webmQualityAt > 45_000 ? Math.min(1, webmRateScale + 0.1) : webmRateScale;
+        if (next !== webmRateScale) {
+          const previousBitrate = Math.max(350_000, bitrate * webmRateScale);
+          webmRateScale = next;
+          webmQualityAt = now;
+          const nextBitrate = Math.max(350_000, bitrate * next);
+          if (nextBitrate !== previousBitrate) {
+            stopRec();
+            console.info("[ezscreenshare] compatibility bitrate", Math.round(nextBitrate));
+          }
+        }
+        return;
+      }
+      if (msg.t === "webmRestart") {
+        restartRec();
+        return;
+      }
       if (msg.t === "watchers" && Array.isArray(msg.viewers)) {
         wantJpeg = msg.viewers.some((v) => v.jpeg);
+        wantPcm = msg.viewers.some((v) => v.pcm && !v.rtc);
+        wantRaw = msg.viewers.some((v) => !v.rtc && !v.jpeg && !v.mse);
+        mseWatchers = msg.viewers.filter((v) => v.mse && !v.rtc).length;
         onWatchers(msg.viewers);
+        if (lastOpusCfg && ws.readyState === WebSocket.OPEN) ws.send(lastOpusCfg);
       } else if (msg.t === "watchers" && Array.isArray(msg.names)) {
         onWatchers(msg.names.map((name) => ({ name, id: "" })));
+        if (lastOpusCfg && ws.readyState === WebSocket.OPEN) ws.send(lastOpusCfg);
       }
     } catch {
       /* ignore */
@@ -682,6 +1153,7 @@ function startIngest(
       bindVideo(next);
       hookAudio(next);
       closeEnc();
+      stopRec();
     },
     setQuality(nextFps, nextBitrate) {
       fps = Math.max(2, Math.min(30, nextFps));
@@ -689,10 +1161,23 @@ function startIngest(
       window.clearInterval(drawTimer);
       drawTimer = window.setInterval(paint, Math.round(1000 / fps));
       closeEnc();
+      stopRec();
+    },
+    setViewersVisible(on) {
+      const send = (): void => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ t: "viewersVisible", on: Boolean(on) }));
+        }
+      };
+      if (ws.readyState === WebSocket.OPEN) send();
+      else ws.addEventListener("open", send, { once: true });
     },
     stop() {
       window.clearInterval(drawTimer);
       closeEnc();
+      stopRec();
+      stopAudioRec();
+      closeAudioEnc();
       unhookAudio();
       void ac?.close();
       tap.srcObject = null;
@@ -704,6 +1189,7 @@ function startIngest(
 
 function startWatch(
   canvas: HTMLCanvasElement,
+  mseVideo: HTMLVideoElement,
   roomId: string,
   watchToken: string,
   nick: string,
@@ -713,6 +1199,9 @@ function startWatch(
     onFrame: () => void;
     onPcm: (rate: number, samples: Int16Array) => void;
     onRtt?: (ms: number) => void;
+    onViewersVisible?: (on: boolean) => void;
+    unlocked?: () => boolean;
+    markUnlocked?: () => void;
   },
 ): { stop: () => void; setRtc: (on: boolean) => void } {
   let stopped = false;
@@ -722,6 +1211,45 @@ function startWatch(
   let decoder: VideoDecoder | null = null;
   let waitingKey = true;
   const canDecode = typeof VideoDecoder !== "undefined";
+  let audioDec: AudioDecoder | null = null;
+  let audioDecReady = false;
+  let compatMode: "webcodecs" | "mse" | "jpeg" = "jpeg";
+  let probed = false;
+  const pendingVid: { kind: number; payload: Uint8Array }[] = [];
+  let mediaSource: MediaSource | null = null;
+  let sourceBuffer: SourceBuffer | null = null;
+  const mseQueue: Uint8Array[] = [];
+  let mseReady = false;
+  let mseShown = false;
+  let mseHasAudio = false;
+  let mseResetAt = 0;
+  let mseGen = 0;
+  let lastWebAt = 0;
+  let statsAt = performance.now();
+  let statsFrames = 0;
+  let presentedFrames = 0;
+  let frameCallback = 0;
+  const countPresentedFrame = (): void => {
+    if (stopped) return;
+    presentedFrames++;
+    frameCallback = mseVideo.requestVideoFrameCallback(countPresentedFrame);
+  };
+  if (typeof mseVideo.requestVideoFrameCallback === "function") {
+    frameCallback = mseVideo.requestVideoFrameCallback(countPresentedFrame);
+  }
+  let statsBytes = 0;
+  let lastNeedInitAt = 0;
+  let lastWebmMime: string | undefined;
+  const pendingWeb: { kind: number; payload: Uint8Array }[] = [];
+  const mseAudio = document.querySelector<HTMLAudioElement>("#compatAudio");
+  let audioSource: MediaSource | null = null;
+  let audioBuffer: SourceBuffer | null = null;
+  const audioQueue: Uint8Array[] = [];
+  let audioReady = false;
+  let audioGen = 0;
+  let audioMime: string | undefined;
+  let audioStalled = false;
+  let audioHadInit = false;
 
   const closeDec = (): void => {
     try {
@@ -731,6 +1259,333 @@ function startWatch(
     }
     decoder = null;
     waitingKey = true;
+  };
+
+  const flushMse = (): void => {
+    if (!sourceBuffer || sourceBuffer.updating || !mseQueue.length) return;
+    if (mseVideo.error) {
+      mseQueue.length = 0;
+      return;
+    }
+    const next = mseQueue.shift();
+    if (!next) return;
+    try {
+      sourceBuffer.appendBuffer(copyAb(next));
+    } catch (err) {
+      const name = err instanceof DOMException ? err.name : "";
+      if (name === "QuotaExceededError") {
+        try {
+          const b = sourceBuffer.buffered;
+          if (b.length) {
+            const end = b.end(b.length - 1);
+            const start = b.start(0);
+            if (end - start > 2) sourceBuffer.remove(start, end - 1.5);
+          }
+        } catch {
+          /* ignore */
+        }
+        mseQueue.unshift(next);
+        return;
+      }
+      mseQueue.length = 0;
+      console.warn("[ezscreenshare] mse append", err);
+    }
+  };
+
+  const isUnlocked = (): boolean => Boolean(opts.unlocked?.());
+
+  const showTapPlay = (need: boolean): void => {
+    const el = document.querySelector("#tapPlay");
+    if (!el) return;
+    if (need && !isUnlocked()) el.classList.remove("hidden");
+    else el.classList.add("hidden");
+  };
+
+  const bufferEnd = (): number => {
+    try {
+      const b = mseVideo.buffered;
+      if (!b.length) return 0;
+      return b.end(b.length - 1);
+    } catch {
+      return 0;
+    }
+  };
+
+  let lastPlayTry = 0;
+  let liveBuffer = new LiveBuffer();
+  let recentStalls = 0;
+  const keepPlaying = (): void => {
+    if (stopped || opts.isRtcLive() || !mseVideo.src) return;
+    if (!mseVideo.buffered.length) return;
+    const now = performance.now();
+    if (now - lastPlayTry < 120) return;
+    lastPlayTry = now;
+    mseVideo.muted = true;
+    mseVideo.volume = 0;
+    mseVideo.controls = true;
+    try {
+      const b = mseVideo.buffered;
+      const lastStart = b.start(b.length - 1);
+      const lastEnd = b.end(b.length - 1);
+      const cur = mseVideo.currentTime;
+      const ahead = lastEnd - Math.max(cur, lastStart);
+      const decision = liveBuffer.update(now, ahead);
+      if (!decision.play) {
+        if (!mseVideo.paused) mseVideo.pause();
+        return;
+      }
+      if (cur < lastStart || decision.seekBehind !== null) {
+        mseVideo.currentTime = Math.max(lastStart, lastEnd - (decision.seekBehind ?? liveBuffer.target));
+      }
+      // PCM uses its own audio clock: do not time-stretch only the video.
+      if (mseVideo.playbackRate !== 1) mseVideo.playbackRate = 1;
+    } catch {
+      /* ignore */
+    }
+    const p = mseVideo.play();
+    if (!p) return;
+    void p.then(() => opts.markUnlocked?.()).catch((err: unknown) => {
+      const name = err && typeof err === "object" && "name" in err ? String((err as { name: string }).name) : "";
+      if (name === "NotAllowedError" && compatMode !== "mse") showTapPlay(true);
+    });
+  };
+
+  const requestJpeg = (): void => {
+    if (stopped || opts.isRtcLive() || compatMode === "jpeg") return;
+    // MSE was chosen: never fall back to stills. JPEG is only for browsers
+    // that cannot play WebM at all (pickCompatVideo === "jpeg").
+    if (compatMode === "mse") return;
+    compatMode = "jpeg";
+    teardownMse(true);
+    canvas.classList.remove("hidden");
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ t: "hello", name: nick, id: identity, jpeg: true, mse: false }));
+    }
+  };
+
+  const askNeedInit = (): void => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const now = performance.now();
+    if (now - lastNeedInitAt < 8000) return;
+    lastNeedInitAt = now;
+    ws.send(JSON.stringify({ t: "needInit" }));
+  };
+
+  const teardownMse = (hide: boolean): void => {
+    mseGen++;
+    mseReady = false;
+    mseShown = false;
+    recentStalls = 0;
+    liveBuffer = new LiveBuffer();
+    mseResetAt = performance.now();
+    mseQueue.length = 0;
+    try {
+      sourceBuffer?.abort();
+    } catch {
+      /* ignore */
+    }
+    sourceBuffer = null;
+    // Do not endOfStream() — Firefox marks the video as errored and we used
+    // to "recover" by switching the viewer to JPEG stills.
+    mediaSource = null;
+    const blobUrl = mseVideo.src;
+    mseVideo.removeAttribute("src");
+    mseVideo.load();
+    if (hide) mseVideo.classList.add("hidden");
+    if (blobUrl.startsWith("blob:")) URL.revokeObjectURL(blobUrl);
+  };
+
+  const closeMse = (): void => teardownMse(compatMode !== "jpeg");
+
+  const ensureMse = (mime?: string): void => {
+    if (sourceBuffer || mediaSource) return;
+    const gen = ++mseGen;
+    const ms = new MediaSource();
+    mediaSource = ms;
+    mseVideo.controls = true;
+    mseVideo.muted = true;
+    mseVideo.volume = 0;
+    mseVideo.playsInline = true;
+    mseVideo.autoplay = true;
+    const onOpen = (): void => {
+      if (gen !== mseGen || sourceBuffer || stopped) return;
+      try {
+        ms.duration = Number.POSITIVE_INFINITY;
+      } catch {
+        try {
+          ms.duration = 1e9;
+        } catch {
+          /* ignore */
+        }
+      }
+      const candidates = [
+        mime,
+        "video/webm;codecs=vp8",
+        'video/webm; codecs="vp8"',
+        "video/webm",
+      ].filter((t): t is string => Boolean(t));
+      const type = candidates.find((t) => MediaSource.isTypeSupported(t)) ?? "video/webm";
+      try {
+        const sb = ms.addSourceBuffer(type);
+        sb.addEventListener("updateend", () => {
+          if (gen !== mseGen) return;
+          try {
+            if (sb.buffered.length && !sb.updating) {
+              const start = sb.buffered.start(0);
+              const end = sb.buffered.end(sb.buffered.length - 1);
+              const cur = mseVideo.currentTime;
+              if (end - start > 8 && cur - start > 4) sb.remove(start, Math.max(start, cur - 2));
+            }
+          } catch {
+            /* ignore */
+          }
+          flushMse();
+          if (mseVideo.buffered.length) keepPlaying();
+        });
+        sourceBuffer = sb;
+        mseReady = true;
+        flushMse();
+      } catch (err) {
+        console.warn("[ezscreenshare] mse open", err);
+      }
+    };
+    ms.addEventListener("sourceopen", onOpen, { once: true });
+    mseVideo.src = URL.createObjectURL(ms);
+    mseVideo.classList.remove("hidden");
+    canvas.classList.add("hidden");
+    showTapPlay(false);
+  };
+
+  const flushAudioMse = (): void => {
+    if (!audioBuffer || audioBuffer.updating || !audioQueue.length || !mseAudio) return;
+    if (mseAudio.error) {
+      audioQueue.length = 0;
+      return;
+    }
+    const next = audioQueue.shift();
+    if (!next) return;
+    try {
+      audioBuffer.appendBuffer(copyAb(next));
+    } catch (err) {
+      const name = err instanceof DOMException ? err.name : "";
+      if (name === "QuotaExceededError") {
+        try {
+          const b = audioBuffer.buffered;
+          if (b.length) audioBuffer.remove(b.start(0), Math.max(b.start(0), b.end(b.length - 1) - 1));
+        } catch {
+          /* ignore */
+        }
+        audioQueue.unshift(next);
+        return;
+      }
+      audioQueue.length = 0;
+      console.warn("[ezscreenshare] audio mse append", err);
+    }
+  };
+
+  const keepAudioPlaying = (): void => {
+    if (stopped || opts.isRtcLive() || !mseAudio?.src) return;
+    const hud = document.querySelector<HTMLInputElement>("#vol");
+    const g = hud ? Math.max(0, Math.min(1, Number(hud.value) / 100)) : 1;
+    mseAudio.volume = g;
+    try {
+      const b = mseAudio.buffered;
+      if (!b.length) return;
+      const end = b.end(b.length - 1);
+      const remain = end - mseAudio.currentTime;
+      if (remain < 0.3) {
+        audioStalled = true;
+        mseAudio.muted = true;
+        mseAudio.dataset.stalled = "1";
+        if (remain < 0.05) return;
+      } else if (remain > 0.7) {
+        audioStalled = false;
+        delete mseAudio.dataset.stalled;
+        mseAudio.muted = g === 0;
+      }
+      if (mseAudio.paused && end - b.start(0) < 0.8) return;
+    } catch {
+      return;
+    }
+    if (!audioStalled) mseAudio.muted = g === 0;
+    void mseAudio.play().then(() => opts.markUnlocked?.()).catch(() => undefined);
+  };
+
+  const teardownAudioMse = (): void => {
+    audioGen++;
+    audioReady = false;
+    audioHadInit = false;
+    audioQueue.length = 0;
+    try {
+      audioBuffer?.abort();
+    } catch {
+      /* ignore */
+    }
+    audioBuffer = null;
+    audioSource = null;
+    if (!mseAudio) return;
+    const blobUrl = mseAudio.src;
+    mseAudio.removeAttribute("src");
+    mseAudio.load();
+    if (blobUrl.startsWith("blob:")) URL.revokeObjectURL(blobUrl);
+  };
+
+  const ensureAudioMse = (mime?: string): void => {
+    if (!mseAudio || audioBuffer || audioSource) return;
+    const gen = ++audioGen;
+    const ms = new MediaSource();
+    audioSource = ms;
+    mseAudio.autoplay = true;
+    mseAudio.controls = false;
+    const onOpen = (): void => {
+      if (gen !== audioGen || audioBuffer || stopped) return;
+      try {
+        ms.duration = Number.POSITIVE_INFINITY;
+      } catch {
+        try {
+          ms.duration = 1e9;
+        } catch {
+          /* ignore */
+        }
+      }
+      const candidates = [
+        mime,
+        "audio/webm;codecs=opus",
+        'audio/webm; codecs="opus"',
+        "audio/webm",
+      ].filter((t): t is string => Boolean(t));
+      const type = candidates.find((t) => MediaSource.isTypeSupported(t)) ?? "audio/webm";
+      try {
+        const sb = ms.addSourceBuffer(type);
+        try {
+          sb.mode = "sequence";
+        } catch {
+          /* Firefox may lock this after the first append */
+        }
+        sb.addEventListener("updateend", () => {
+          if (gen !== audioGen) return;
+          flushAudioMse();
+          if (mseAudio.buffered.length) keepAudioPlaying();
+        });
+        audioBuffer = sb;
+        audioReady = true;
+        flushAudioMse();
+      } catch (err) {
+        console.warn("[ezscreenshare] audio mse open", err);
+      }
+    };
+    ms.addEventListener("sourceopen", onOpen, { once: true });
+    mseAudio.src = URL.createObjectURL(ms);
+  };
+
+  const closeAudioDec = (): void => {
+    try {
+      audioDec?.close();
+    } catch {
+      /* ignore */
+    }
+    audioDec = null;
+    audioDecReady = false;
   };
 
   const ensureDec = (codec: string, w: number, h: number): VideoDecoder | null => {
@@ -760,8 +1615,108 @@ function startWatch(
     return next;
   };
 
+  const ensureAudioDec = (cfg: {
+    codec: string;
+    sampleRate: number;
+    channels: number;
+    description?: Uint8Array;
+  }): AudioDecoder | null => {
+    if (typeof AudioDecoder === "undefined") return null;
+    if (audioDec && audioDec.state === "configured") return audioDec;
+    closeAudioDec();
+    const next = new AudioDecoder({
+      output(frame) {
+        if (opts.isRtcLive()) {
+          frame.close();
+          return;
+        }
+        const n = frame.numberOfFrames;
+        const f32 = new Float32Array(n);
+        frame.copyTo(f32, { planeIndex: 0 });
+        const samples = new Int16Array(n);
+        for (let i = 0; i < n; i++) {
+          const v = Math.max(-1, Math.min(1, f32[i]!));
+          samples[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+        }
+        opts.onPcm(frame.sampleRate, samples);
+        frame.close();
+      },
+      error(err) {
+        console.warn("[ezscreenshare] opus decode", err);
+        audioDecReady = false;
+      },
+    });
+    const init: AudioDecoderConfig = {
+      codec: cfg.codec || "opus",
+      sampleRate: cfg.sampleRate,
+      numberOfChannels: cfg.channels || 1,
+    };
+    if (cfg.description && cfg.description.byteLength) init.description = copyAb(cfg.description);
+    try {
+      next.configure(init);
+    } catch {
+      delete init.description;
+      next.configure(init);
+    }
+    audioDec = next;
+    audioDecReady = true;
+    return next;
+  };
+
+  const handleOpus = (kind: number, payload: Uint8Array): void => {
+    if (opts.isRtcLive() || mseHasAudio || compatMode === "mse") return;
+    if (kind === OPUS_CFG) {
+      try {
+        const cfg = JSON.parse(new TextDecoder().decode(payload)) as {
+          codec?: string;
+          sampleRate?: number;
+          channels?: number;
+          description?: string;
+        };
+        if (!cfg.sampleRate) return;
+        ensureAudioDec({
+          codec: cfg.codec || "opus",
+          sampleRate: cfg.sampleRate,
+          channels: cfg.channels || 1,
+          description: cfg.description ? b64ToU8(cfg.description) : undefined,
+        });
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    if (kind === OPUS_FRAME) {
+      if (payload.length < 6 || !audioDec || audioDec.state !== "configured" || !audioDecReady) return;
+      if (audioDec.decodeQueueSize > 16) return;
+      const key = payload[0] === 1;
+      const ts = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(1, true);
+      try {
+        audioDec.decode(
+          new EncodedAudioChunk({
+            type: key ? "key" : "delta",
+            timestamp: ts,
+            data: copyAb(payload.subarray(5)),
+          }),
+        );
+      } catch (err) {
+        console.warn("[ezscreenshare] opus chunk", err);
+        audioDecReady = false;
+      }
+    }
+  };
+
+  const showCompatVideo = (): void => {
+    canvas.classList.add("hidden");
+    mseVideo.classList.remove("hidden");
+    opts.onFrame();
+  };
+
   const handleVid = (kind: number, payload: Uint8Array): void => {
     if (opts.isRtcLive()) return;
+    if (!probed) {
+      pendingVid.push({ kind, payload: new Uint8Array(payload) });
+      return;
+    }
     if (kind === VID_CFG) {
       try {
         const cfg = JSON.parse(new TextDecoder().decode(payload)) as {
@@ -769,13 +1724,16 @@ function startWatch(
           w?: number;
           h?: number;
         };
-        if (cfg.codec && cfg.w && cfg.h) ensureDec(cfg.codec, cfg.w, cfg.h);
+        if (cfg.codec && cfg.w && cfg.h && compatMode !== "mse") {
+          ensureDec(cfg.codec, cfg.w, cfg.h);
+        }
       } catch {
         /* ignore */
       }
       return;
     }
     if (kind === VID_JPEG) {
+      if (compatMode !== "jpeg") return;
       const blob = new Blob([copyAb(payload)], { type: "image/jpeg" });
       void createImageBitmap(blob).then((bmp) => {
         if (stopped || opts.isRtcLive() || !ctx) {
@@ -792,12 +1750,14 @@ function startWatch(
       return;
     }
     if (kind === VID_FRAME) {
-      if (payload.length < 6 || !decoder || decoder.state !== "configured") return;
+      if (payload.length < 6) return;
       const key = payload[0] === 1;
-      if (waitingKey && !key) return;
-      if (decoder.decodeQueueSize > 8 && !key) return;
       const ts = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(1, true);
       const data = payload.subarray(5);
+      if (compatMode === "mse") return;
+      if (!decoder || decoder.state !== "configured") return;
+      if (waitingKey && !key) return;
+      if (decoder.decodeQueueSize > 8 && !key) return;
       try {
         decoder.decode(
           new EncodedVideoChunk({
@@ -814,42 +1774,171 @@ function startWatch(
     }
   };
 
+  const handleWeb = (kind: number, payload: Uint8Array): void => {
+    if (opts.isRtcLive()) return;
+    if (!probed) {
+      pendingWeb.push({ kind, payload: new Uint8Array(payload) });
+      return;
+    }
+    if (compatMode !== "mse") return;
+    if (kind === WEB_CFG) {
+      try {
+        const cfg = JSON.parse(new TextDecoder().decode(payload)) as {
+          mime?: string; pipeline?: string; fps?: number; w?: number; h?: number;
+        };
+        console.info("[ezscreenshare] compatibility host", {
+          pipeline: cfg.pipeline || "unreported (older host build)",
+          requestedFps: cfg.fps ?? null,
+          width: cfg.w, height: cfg.h,
+        });
+        // Video-only WebM. Muxed Opus in Chrome MediaRecorder corrupts LibreWolf.
+        mseHasAudio = false;
+        lastWebmMime = cfg.mime;
+      } catch {
+        lastWebmMime = undefined;
+      }
+      teardownMse(false);
+      ensureMse(lastWebmMime);
+      return;
+    }
+    if (kind === WEB_CHUNK) {
+      lastWebAt = performance.now();
+      statsBytes += payload.byteLength;
+      const chunk = new Uint8Array(payload);
+      if (isEbml(chunk) && mseShown) {
+        teardownMse(false);
+        ensureMse(lastWebmMime);
+      }
+      mseQueue.push(chunk);
+      if (mseQueue.length > 16) {
+        teardownMse(false);
+        askNeedInit();
+        return;
+      }
+      if (mseReady) flushMse();
+      return;
+    }
+    if (kind === WEB_ACFG || kind === WEB_ACHUNK) {
+      return;
+    }
+  };
+
   const handleBuf = (buf: Uint8Array): void => {
+    const web = parseWeb(buf);
+    if (web) {
+      handleWeb(web.kind, web.payload);
+      return;
+    }
     const vid = parseVid(buf);
     if (vid) {
       handleVid(vid.kind, vid.payload);
+      return;
+    }
+    const opus = parseOpus(buf);
+    if (opus) {
+      handleOpus(opus.kind, opus.payload);
       return;
     }
     if (isPcmPacket(buf)) {
       if (opts.isRtcLive()) return;
       const rate = new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getUint32(4, true);
       const samples = new Int16Array(
-        buf.buffer,
-        buf.byteOffset + 8,
-        Math.floor((buf.byteLength - 8) / 2),
+        buf.buffer.slice(buf.byteOffset + 8, buf.byteOffset + buf.byteLength),
       );
       opts.onPcm(rate, samples);
     }
   };
 
+  let wantPcm = false;
+  const sendHello = (): void => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    ws.send(
+      JSON.stringify({
+        t: "hello",
+        name: nick,
+        id: identity,
+        jpeg: compatMode === "jpeg",
+        mse: compatMode === "mse",
+        pcm: wantPcm,
+      }),
+    );
+  };
+
+  mseVideo.addEventListener("loadeddata", () => {
+    mseShown = true;
+    showCompatVideo();
+    if (isUnlocked()) {
+      showTapPlay(false);
+      keepPlaying();
+    }
+    opts.onFrame();
+  });
+  mseVideo.addEventListener("playing", () => {
+    opts.markUnlocked?.();
+    showTapPlay(false);
+    opts.onFrame();
+  });
+  mseVideo.addEventListener("pause", () => {
+    if (stopped || opts.isRtcLive() || compatMode !== "mse" || !isUnlocked()) return;
+    if (mseVideo.buffered.length) keepPlaying();
+  });
+  mseVideo.addEventListener("waiting", () => {
+    if (opts.isRtcLive()) return;
+    if (mseShown && !liveBuffer.waiting) recentStalls++;
+    liveBuffer.stalled(performance.now());
+    if (isUnlocked()) keepPlaying();
+  });
+  mseAudio?.addEventListener("waiting", () => {
+    audioStalled = true;
+    if (mseAudio) {
+      mseAudio.muted = true;
+      mseAudio.dataset.stalled = "1";
+    }
+  });
+  mseAudio?.addEventListener("playing", () => {
+    audioStalled = false;
+    if (mseAudio) delete mseAudio.dataset.stalled;
+    opts.markUnlocked?.();
+    keepAudioPlaying();
+  });
+  mseAudio?.addEventListener("pause", () => {
+    if (stopped || opts.isRtcLive() || compatMode !== "mse") return;
+    keepAudioPlaying();
+  });
+  const onVis = (): void => {
+    if (!mseAudio || compatMode !== "mse") return;
+    if (document.hidden) {
+      audioStalled = true;
+      mseAudio.muted = true;
+      mseAudio.dataset.stalled = "1";
+      return;
+    }
+    keepAudioPlaying();
+  };
+  document.addEventListener("visibilitychange", onVis);
+
   const ws = openFallback(`/ws/watch/${encodeURIComponent(roomId)}`, watchToken);
   ws.binaryType = "arraybuffer";
   ws.addEventListener("open", () => {
     void (async () => {
-      let jpeg = typeof VideoDecoder === "undefined";
-      if (!jpeg) {
-        try {
-          const probe = await VideoDecoder.isConfigSupported({
-            codec: "vp8",
-            codedWidth: 640,
-            codedHeight: 360,
-          });
-          jpeg = !probe.supported;
-        } catch {
-          jpeg = true;
-        }
+      compatMode = await pickCompatVideo();
+      wantPcm = compatMode !== "webcodecs";
+      probed = true;
+      console.info("[ezscreenshare] compatibility ready", compatMode, wantPcm ? "pcm" : "opus");
+      sendHello();
+      if (compatMode === "mse") {
+        mseVideo.controls = true;
+        mseVideo.classList.remove("hidden");
+        showTapPlay(false);
+        if (isUnlocked()) keepPlaying();
+        opts.onFrame();
+      } else {
+        showTapPlay(true);
       }
-      ws.send(JSON.stringify({ t: "hello", name: nick, id: identity, jpeg }));
+      const queued = pendingVid.splice(0, pendingVid.length);
+      for (const p of queued) handleVid(p.kind, p.payload);
+      const queuedWeb = pendingWeb.splice(0, pendingWeb.length);
+      for (const p of queuedWeb) handleWeb(p.kind, p.payload);
     })();
   });
   const pingTimer = window.setInterval(() => {
@@ -859,10 +1948,34 @@ function startWatch(
     if (pendingPing.size > 8) pendingPing.delete(pendingPing.keys().next().value!);
     ws.send(JSON.stringify({ t: "ping", n: pingN }));
   }, 2000);
+  const stallTimer = window.setInterval(() => {
+    if (stopped || opts.isRtcLive() || compatMode !== "mse") return;
+    const now = performance.now();
+    if (now - statsAt >= 5000) {
+      const seconds = (now - statsAt) / 1000;
+      console.info("[ezscreenshare] compatibility video", {
+        presentedFps: frameCallback ? Math.round((presentedFrames - statsFrames) / seconds) : null,
+        kbps: Math.round(statsBytes * 8 / seconds / 1000),
+        bufferedSeconds: Number(Math.max(0, bufferEnd() - mseVideo.currentTime).toFixed(2)),
+        visible: !document.hidden,
+        targetBufferSeconds: liveBuffer.target,
+      });
+      if (ws.readyState === WebSocket.OPEN && !document.hidden && mseShown) {
+        ws.send(JSON.stringify({ t: "playback", stalls: recentStalls, buffered: Math.max(0, bufferEnd() - mseVideo.currentTime) }));
+      }
+      recentStalls = 0;
+      statsAt = now;
+      statsFrames = presentedFrames;
+      statsBytes = 0;
+    }
+    if (lastWebAt && now - lastWebAt > 2500) askNeedInit();
+    if (mseVideo.buffered.length && lastWebAt && now - lastWebAt < 1000) keepPlaying();
+    if (mseAudio && mseAudio.buffered.length) keepAudioPlaying();
+  }, 400);
   ws.addEventListener("message", (ev) => {
     if (typeof ev.data === "string") {
       try {
-        const msg = JSON.parse(ev.data) as { t?: string; n?: number };
+        const msg = JSON.parse(ev.data) as { t?: string; n?: number; on?: boolean; showViewers?: boolean };
         if (msg.t === "pong" && typeof msg.n === "number") {
           const t0 = pendingPing.get(msg.n);
           pendingPing.delete(msg.n);
@@ -871,6 +1984,10 @@ function startWatch(
             ws.send(JSON.stringify({ t: "rtt", ms }));
             opts.onRtt?.(ms);
           }
+        } else if (msg.t === "viewersVisible" && typeof msg.on === "boolean") {
+          opts.onViewersVisible?.(msg.on);
+        } else if (msg.t === "hello" && typeof msg.showViewers === "boolean") {
+          opts.onViewersVisible?.(msg.showViewers);
         }
       } catch {
         /* ignore */
@@ -881,14 +1998,29 @@ function startWatch(
   });
   const setRtc = (on: boolean): void => {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: "rtc", on }));
-    if (on) canvas.classList.add("hidden");
+    if (on) {
+      canvas.classList.add("hidden");
+      mseVideo.classList.add("hidden");
+      showTapPlay(false);
+    } else if (compatMode === "mse") {
+      mseVideo.controls = true;
+      mseVideo.classList.remove("hidden");
+      showTapPlay(false);
+      keepPlaying();
+    }
   };
   return {
     setRtc,
     stop() {
       stopped = true;
       window.clearInterval(pingTimer);
+      window.clearInterval(stallTimer);
+      if (frameCallback) mseVideo.cancelVideoFrameCallback(frameCallback);
       closeDec();
+      closeAudioDec();
+      closeMse();
+      teardownAudioMse();
+      document.removeEventListener("visibilitychange", onVis);
       if (ws.readyState === WebSocket.OPEN) ws.close();
     },
   };
@@ -930,6 +2062,11 @@ async function getStream(opts: {
   if (isElectron && window.ez && opts.sourceId) {
     await window.ez.setCapture(opts.sourceId, opts.audio);
   }
+  const windowsLoopback = isElectron && desktopPlatform() === "win32";
+  const selection = readAudioSelection();
+  if (windowsLoopback && selection.apps.length) throw new Error("This Windows build supports Entire system audio only; clear the application selection first.");
+  const wantsAudio = opts.audio && !(isElectron && selection.mode === "include" && !selection.apps.length);
+  if (windowsLoopback) await window.ez?.setCaptureAudio?.(wantsAudio);
   const display: DisplayMediaStreamOptions = {
     video: {
       frameRate: { ideal: opts.fps },
@@ -937,7 +2074,7 @@ async function getStream(opts: {
       width: { ideal: Math.round(opts.height * (16 / 9)) },
     },
     // Electron/Linux: PipeWire loopback is silent. Monitor is added below.
-    audio: opts.audio && !isElectron
+    audio: wantsAudio && (!isElectron || windowsLoopback)
       ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
       : false,
   };
@@ -947,7 +2084,10 @@ async function getStream(opts: {
   const stream = await navigator.mediaDevices.getDisplayMedia(display);
   const video = stream.getVideoTracks()[0];
   if (video) applyQuality(video, opts.height, opts.fps);
-  if (opts.audio && isElectron) await addSystemAudio(stream);
+  if (wantsAudio && windowsLoopback) {
+    lastAudioLabel = stream.getAudioTracks().length ? "Entire system" : "";
+    if (!stream.getAudioTracks().length) console.warn("[ezscreenshare] Windows loopback returned no audio track");
+  } else if (wantsAudio && isElectron) await addSystemAudio(stream);
   else if (opts.audio) {
     const a = stream.getAudioTracks()[0];
     if (a) a.contentHint = "music";
@@ -961,6 +2101,18 @@ async function getStream(opts: {
 
 let lastAudioLabel = "";
 
+function desktopPlatform(): string {
+  return window.ez?.platform ?? (/Win/.test(navigator.platform) ? "win32" : /Mac/.test(navigator.platform) ? "darwin" : "linux");
+}
+
+function readAudioSelection(): AudioSelection {
+  try {
+    const saved = localStorage.getItem("ezscreenshare.audioSelection");
+    if (saved) return normalizeAudioSelection(JSON.parse(saved));
+  } catch { /* migrate the previous single-source setting */ }
+  return normalizeAudioSelection(localStorage.getItem("ezscreenshare.audioSrc") || "system");
+}
+
 async function addSystemAudio(stream: MediaStream): Promise<void> {
   lastAudioLabel = "";
   for (const t of stream.getAudioTracks()) {
@@ -972,15 +2124,28 @@ async function addSystemAudio(stream: MediaStream): Promise<void> {
     noiseSuppression: false,
     autoGainControl: false,
   };
-  let wanted =
-    (document.querySelector("#audioSrcLive") as HTMLSelectElement | null)?.value ||
-    (document.querySelector("#audioSrc") as HTMLSelectElement | null)?.value ||
-    localStorage.getItem("ezscreenshare.audioSrc") ||
-    "system";
-  if (wanted === "none") return;
-  if (wanted === "auto") wanted = "system";
+  const wanted = readAudioSelection();
+  if (wanted.mode === "include" && !wanted.apps.length) {
+    await window.ez?.releaseAudioTap();
+    return;
+  }
+  if (desktopPlatform() === "win32") {
+    if (wanted.apps.length) throw new Error("This Windows build supports Entire system audio only.");
+    await window.ez?.setCaptureAudio?.(true);
+    const extra = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: constraints });
+    extra.getVideoTracks().forEach(track => track.stop());
+    extra.getAudioTracks().forEach(track => stream.addTrack(track));
+    lastAudioLabel = extra.getAudioTracks().length ? "Entire system" : "";
+    return;
+  }
   if (window.ez?.beginMonitorCapture) {
-    const session = await window.ez.beginMonitorCapture(wanted);
+    let request: string | AudioSelection = wanted;
+    if (!window.ez.audioSelectionVersion) {
+      if (wanted.mode === "exclude" && !wanted.apps.length) request = "system";
+      else if (wanted.mode === "include" && wanted.apps.length === 1) request = `app:${wanted.apps[0]}`;
+      else throw new Error("Restart the desktop app from the updated project to select multiple audio sources.");
+    }
+    const session = await window.ez.beginMonitorCapture(request);
     try {
       if (session.ok) {
         const hints = (session.hints?.length ? session.hints : [session.label, "ezscreenshare"])
@@ -1011,7 +2176,7 @@ async function addSystemAudio(stream: MediaStream): Promise<void> {
           t.contentHint = "music";
           stream.addTrack(t);
         }
-        lastAudioLabel = pick.label || session.label;
+        lastAudioLabel = session.label || pick.label;
         console.info("[ezscreenshare] system audio", lastAudioLabel, pick.deviceId);
         return;
       }
@@ -1021,48 +2186,7 @@ async function addSystemAudio(stream: MediaStream): Promise<void> {
       await window.ez.endMonitorCapture(session.prev);
     }
   }
-  if (!window.ez) {
-    try {
-      const probe = await navigator.mediaDevices.getUserMedia({ audio: true });
-      for (const t of probe.getTracks()) t.stop();
-    } catch {
-      /* labels may still populate */
-    }
-  }
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  const inputs = devices.filter((d) => d.kind === "audioinput");
-  const hint = ((await window.ez?.monitorHint?.()) || "").toLowerCase();
-  const ranked = inputs
-    .map((d) => {
-      const l = d.label.toLowerCase();
-      let score = 0;
-      if (hint && (l === hint || l.includes(hint) || hint.includes(l))) score += 20;
-      if (/monitor/.test(l)) score += 8;
-      if (/headphone|headset|analog/.test(l) && /monitor/.test(l)) score += 4;
-      if (/hdmi|iec958|displayport|digital only/.test(l)) score -= 8;
-      if (/microphone|mono-fallback|input/.test(l) && !/monitor/.test(l)) score -= 6;
-      return { d, score };
-    })
-    .sort((a, b) => b.score - a.score);
-  const pick = ranked.find((x) => x.score > 0)?.d;
-  if (!pick) {
-    console.warn(
-      "[ezscreenshare] no PipeWire sink monitor",
-      inputs.map((d) => d.label),
-      "hint",
-      hint,
-    );
-    return;
-  }
-  const extra = await navigator.mediaDevices.getUserMedia({
-    audio: { ...constraints, deviceId: { exact: pick.deviceId } },
-  });
-  for (const t of extra.getAudioTracks()) {
-    t.contentHint = "music";
-    stream.addTrack(t);
-  }
-  lastAudioLabel = pick.label;
-  console.info("[ezscreenshare] system audio", pick.label);
+  throw new Error("Could not capture the selected applications. Check PipeWire and restart the desktop app.");
 }
 
 async function copyText(text: string): Promise<void> {
@@ -1123,13 +2247,12 @@ function renderHost(): void {
         <div class="row">
           <label class="check ${isElectron ? "" : "hidden"}"><input id="audio" type="checkbox" checked /> share audio</label>
           <label class="check"><input id="tcp" type="checkbox" checked /> force TCP</label>
+          <label class="check"><input id="showViewers" type="checkbox" checked /> viewers see who's watching</label>
         </div>
         <div class="row ${isElectron ? "" : "hidden"}" id="audioSrcRow">
-          <label class="field">audio source
-            <select id="audioSrc">
-              <option value="system">Entire system</option>
-            </select>
-          </label>
+          <div class="field">audio sources
+            <details class="audio-picker" id="audioSrc"><summary>Entire system</summary><div class="audio-options"></div></details>
+          </div>
         </div>
         <div id="sourceWrap" class="${isElectron ? "" : "hidden"}">
           <p class="sub">source</p>
@@ -1144,17 +2267,22 @@ function renderHost(): void {
       <div id="live" class="hidden">
         <div class="stage"><video id="preview" autoplay muted playsinline></video></div>
         <div class="hud">
-          <span class="pill live">LIVE</span>
-          <span class="pill" id="ping">ping —</span>
-          <span class="pill hidden" id="stats">—</span>
-          <span class="pill" id="audioState">audio ?</span>
+          <div class="hud-status">
+            <span class="pill live">LIVE</span>
+            <span class="pill" id="ping">ping —</span>
+            <span class="pill hidden" id="stats">—</span>
+            <span class="pill" id="audioState">audio ?</span>
+          </div>
           <div class="linkbox">
             <input id="link" class="mono" type="text" readonly />
             <button class="btn secondary" id="copy" type="button">copy link</button>
           </div>
-          <button class="btn secondary" id="statsToggle" type="button">stats</button>
-          <button class="btn secondary" id="switch" type="button">change source</button>
-          <button class="btn secondary" id="stop" type="button">stop</button>
+          <div class="hud-actions">
+            <label class="check"><input id="showViewersLive" type="checkbox" checked /> viewers see who's watching</label>
+            <button class="btn secondary" id="statsToggle" type="button">stats</button>
+            <button class="btn secondary" id="switch" type="button">change source</button>
+            <button class="btn secondary" id="stop" type="button">stop</button>
+          </div>
         </div>
         <div id="liveSources" class="live-sources hidden">
           <p class="sub">pick a source</p>
@@ -1170,11 +2298,9 @@ function renderHost(): void {
             </select>
           </label>
           ${fpsSelectHtml("fpsLive")}
-          <label class="field ${isElectron ? "" : "hidden"}" id="audioSrcLiveWrap">audio source
-            <select id="audioSrcLive">
-              <option value="system">Entire system</option>
-            </select>
-          </label>
+          <div class="field ${isElectron ? "" : "hidden"}" id="audioSrcLiveWrap">audio sources
+            <details class="audio-picker" id="audioSrcLive"><summary>Entire system</summary><div class="audio-options"></div></details>
+          </div>
         </div>
         <div class="panel people-panel">
           <div class="sub">connected</div>
@@ -1188,6 +2314,10 @@ function renderHost(): void {
   const nick = qs<HTMLInputElement>("#nick");
   nick.value = localStorage.getItem(nickKey) || "host";
   const hostKeyInput = qs<HTMLInputElement>("#hostKey");
+  const showViewersSetup = qs<HTMLInputElement>("#showViewers");
+  const showViewersLive = qs<HTMLInputElement>("#showViewersLive");
+  showViewersSetup.checked = localStorage.getItem(showViewersKey) !== "0";
+  showViewersLive.checked = showViewersSetup.checked;
   hostKeyInput.value = localStorage.getItem(hostKey) || "";
   const err = qs("#err");
   let selected: Source | null = null;
@@ -1196,7 +2326,7 @@ function renderHost(): void {
   let videoPub: LocalTrackPublication | null = null;
   let audioPub: LocalTrackPublication | null = null;
   let ingest: ReturnType<typeof startIngest> | null = null;
-  let fallbackWatchers: { name: string; id: string; rtt?: number; jpeg?: boolean; rtc?: boolean }[] = [];
+  let fallbackWatchers: CompatWatcher[] = [];
   const pingById = new Map<string, number>();
   let stopPing: (() => void) | null = null;
   let stopStats: (() => void) | null = null;
@@ -1236,27 +2366,76 @@ function renderHost(): void {
     }
   }
 
-  qs("#refresh").addEventListener("click", () => void loadSources(qs("#sources")));
+  qs("#refresh").addEventListener("click", () => {
+    void Promise.all([loadSources(qs("#sources")), fillAudioSelects()]).catch(error => {
+      err.textContent = error instanceof Error ? error.message : String(error);
+    });
+  });
   void loadSources(qs("#sources"));
 
-  async function fillAudioSelects(): Promise<void> {
-    let saved = localStorage.getItem("ezscreenshare.audioSrc") || "system";
-    if (saved === "auto" || saved === "none") saved = "system";
-    const sources = (await window.ez?.listAudioSources?.()) ?? [
-      { id: "system", label: "Entire system", monitor: true, running: true },
-    ];
-    for (const id of ["audioSrc", "audioSrcLive"] as const) {
-      const el = document.querySelector<HTMLSelectElement>(`#${id}`);
-      if (!el) continue;
-      el.replaceChildren();
-      for (const s of sources) {
-        const o = document.createElement("option");
-        o.value = s.id;
-        o.textContent = s.label;
-        el.appendChild(o);
+  let audioSourceOptions: { id: string; label: string }[] = [];
+  function drawAudioPickers(): void {
+    const selection = readAudioSelection();
+    const apps = audioSourceOptions.filter(source => source.id.startsWith("app:"));
+    for (const id of ["audioSrc", "audioSrcLive"]) {
+      const root = qs<HTMLElement>(`#${id}`);
+      root.querySelector("summary")!.textContent = audioSelectionLabel({
+        ...selection, apps: selection.apps.filter(name => apps.some(source => source.id === `app:${name}`)),
+      });
+      const list = root.querySelector(".audio-options")!;
+      list.replaceChildren();
+      for (const source of [{ id: "system", label: desktopPlatform() === "linux" ? "Entire system (uncheck apps to exclude)" : "Entire system" }, ...apps]) {
+        const label = document.createElement("label");
+        label.className = "check";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.dataset.audioSource = source.id;
+        input.checked = source.id === "system" ? selection.mode === "exclude" : includesAudioApp(selection, source.id.slice(4));
+        label.append(input, document.createTextNode(source.label));
+        list.append(label);
       }
-      el.value = [...el.options].some((o) => o.value === saved) ? saved : "system";
     }
+  }
+  let audioRefreshGeneration = 0;
+  async function fillAudioSelects(): Promise<void> {
+    const generation = ++audioRefreshGeneration;
+    const sources = (await window.ez?.listAudioSources?.()) ?? [];
+    if (generation !== audioRefreshGeneration) return;
+    audioSourceOptions = sources;
+    const selection = readAudioSelection();
+    const apps = selection.apps.filter(name => sources.some(source => source.id === `app:${name}`));
+    // Forget vanished selected apps. Retain exclusions internally so a
+    // restarted voice client cannot unexpectedly enter an "all except" mix.
+    if (selection.mode === "include" && apps.length !== selection.apps.length) {
+      localStorage.setItem("ezscreenshare.audioSelection", JSON.stringify({ ...selection, apps }));
+      audioChange = audioChange.then(reattachAudio).catch(error => {
+        err.textContent = error instanceof Error ? error.message : String(error);
+      });
+    }
+    drawAudioPickers();
+  }
+  let audioChange = Promise.resolve();
+  function changeAudioSelection(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const id = input.dataset.audioSource;
+    if (!id) return;
+    const selection = readAudioSelection();
+    if (id === "system") {
+      selection.mode = input.checked ? "exclude" : "include";
+      selection.apps = [];
+    } else {
+      const name = id.slice(4);
+      const listed = selection.mode === "include" ? input.checked : !input.checked;
+      selection.apps = selection.apps.filter(app => app !== name);
+      if (listed) selection.apps.push(name);
+    }
+    localStorage.setItem("ezscreenshare.audioSelection", JSON.stringify(normalizeAudioSelection(selection)));
+    drawAudioPickers();
+    const root = event.currentTarget as HTMLElement;
+    [...root.querySelectorAll<HTMLInputElement>("input")].find(item => item.dataset.audioSource === id)?.focus();
+    audioChange = audioChange.then(reattachAudio).catch(error => {
+      err.textContent = error instanceof Error ? error.message : String(error);
+    });
   }
 
   function syncAudioRow(): void {
@@ -1272,14 +2451,11 @@ function renderHost(): void {
 
   if (isElectron) void fillAudioSelects();
   qs("#audio").addEventListener("change", syncAudioRow);
-  qs("#audioSrc").addEventListener("focus", () => void fillAudioSelects());
-  qs("#audioSrcLive").addEventListener("focus", () => void fillAudioSelects());
-  document.querySelector("#audioSrc")?.addEventListener("change", () => {
-    const v = qs<HTMLSelectElement>("#audioSrc").value;
-    localStorage.setItem("ezscreenshare.audioSrc", v);
-    const live = document.querySelector<HTMLSelectElement>("#audioSrcLive");
-    if (live) live.value = v;
-  });
+  for (const id of ["audioSrc", "audioSrcLive"]) {
+    const picker = qs<HTMLDetailsElement>(`#${id}`);
+    picker.addEventListener("change", changeAudioSelection);
+    picker.addEventListener("toggle", () => { if (picker.open) void fillAudioSelects(); });
+  }
 
   function people(): void {
     const ul = qs("#people");
@@ -1367,6 +2543,7 @@ function renderHost(): void {
       else {
         audioPub = await room.localParticipant.publishTrack(audio, {
           source: Track.Source.ScreenShareAudio,
+          stream: "screenshare",
           red: true,
           dtx: false,
         });
@@ -1374,7 +2551,7 @@ function renderHost(): void {
     }
     video?.addEventListener("ended", () => void stop());
     const audioOn = (localStream?.getAudioTracks().length ?? 0) > 0;
-    const audioState = document.querySelector("#audioState");
+    const audioState = document.querySelector<HTMLElement>("#audioState");
     if (audioState) {
       audioState.textContent = audioOn
         ? `audio on${lastAudioLabel ? ` · ${lastAudioLabel}` : ""}`
@@ -1392,11 +2569,15 @@ function renderHost(): void {
     const fps = Number(qs<HTMLSelectElement>("#fps").value);
     const audio = qs<HTMLInputElement>("#audio").checked;
     const forceTcp = qs<HTMLInputElement>("#tcp").checked;
+    const showViewers = showViewersSetup.checked;
+    localStorage.setItem(showViewersKey, showViewers ? "1" : "0");
+    showViewersLive.checked = showViewers;
     try {
       const created = await api<CreateResp>("/api/rooms", {
         hostPassword: hostKeyInput.value,
         password: qs<HTMLInputElement>("#password").value,
         forceTcp,
+        showViewers,
         nickname: nick.value.trim() || "host",
       });
       const stream = await getStream({
@@ -1428,6 +2609,7 @@ function renderHost(): void {
         },
         { fps, bitrate: ingestBitrate(height, fps) },
       );
+      ingest.setViewersVisible(showViewers);
       stopStats?.();
       stopStats = bindStatsToggle(qs("#statsToggle"), qs("#stats"), async () => {
         const track = videoPub?.videoTrack ?? (videoPub?.track as LocalVideoTrack | undefined);
@@ -1478,6 +2660,17 @@ function renderHost(): void {
     void start();
   });
   qs("#stop").addEventListener("click", () => void stop());
+  const onShowViewers = (): void => {
+    const on = showViewersLive.checked;
+    showViewersSetup.checked = on;
+    localStorage.setItem(showViewersKey, on ? "1" : "0");
+    ingest?.setViewersVisible(on);
+  };
+  showViewersLive.addEventListener("change", onShowViewers);
+  showViewersSetup.addEventListener("change", () => {
+    showViewersLive.checked = showViewersSetup.checked;
+    localStorage.setItem(showViewersKey, showViewersSetup.checked ? "1" : "0");
+  });
   qs("#copy").addEventListener("click", async () => {
     const btn = qs("#copy");
     try {
@@ -1560,6 +2753,7 @@ function renderHost(): void {
       else {
         audioPub = await room.localParticipant.publishTrack(audio, {
           source: Track.Source.ScreenShareAudio,
+          stream: "screenshare",
           red: true,
           dtx: false,
         });
@@ -1569,7 +2763,7 @@ function renderHost(): void {
       audioPub = null;
     }
     ingest?.setStream(localStream);
-    const audioState = document.querySelector("#audioState");
+    const audioState = document.querySelector<HTMLElement>("#audioState");
     const audioOn = localStream.getAudioTracks().length > 0;
     if (audioState) {
       audioState.textContent = audioOn
@@ -1579,15 +2773,7 @@ function renderHost(): void {
     }
   }
 
-  qs("#audioSrcLive").addEventListener("change", () => {
-    const v = qs<HTMLSelectElement>("#audioSrcLive").value;
-    localStorage.setItem("ezscreenshare.audioSrc", v);
-    const setup = document.querySelector<HTMLSelectElement>("#audioSrc");
-    if (setup) setup.value = v;
-    void reattachAudio().catch((e) => {
-      err.textContent = e instanceof Error ? e.message : String(e);
-    });
-  });
+
 }
 
 function renderViewer(roomId: string): void {
@@ -1615,20 +2801,29 @@ function renderViewer(roomId: string): void {
       <div id="watch" class="hidden">
         <div class="stage">
           <video id="remote" class="hidden" autoplay playsinline webkit-playsinline></video>
+          <video id="compatVid" class="compat hidden" autoplay playsinline webkit-playsinline controls></video>
           <canvas id="compat" class="compat hidden"></canvas>
+          <button type="button" id="tapPlay" class="tap-play hidden">click to play</button>
         </div>
         <div class="hud">
-          <span class="pill" id="status">connecting</span>
-          <span class="pill" id="ping">ping —</span>
-          <span class="pill hidden" id="stats">—</span>
-          <label class="field">quality
-            <select id="vq">
-              <option value="auto" selected>auto</option>
-              <option value="low">480</option>
-              <option value="high">full</option>
-            </select>
-          </label>
-          <button class="btn secondary" id="statsToggle" type="button">stats</button>
+          <div class="hud-status">
+            <span class="pill" id="status">connecting</span>
+            <span class="pill" id="ping">ping —</span>
+            <span class="pill hidden" id="stats">—</span>
+          </div>
+          <div class="hud-actions">
+            <label class="hud-field">quality
+              <select id="vq">
+                <option value="auto" selected>auto</option>
+                <option value="low">480</option>
+                <option value="high">full</option>
+              </select>
+            </label>
+            <label class="hud-field">volume
+              <input id="vol" type="range" min="0" max="100" value="100" />
+            </label>
+            <button class="btn secondary" id="statsToggle" type="button">stats</button>
+          </div>
         </div>
         <div class="panel people-panel">
           <div class="sub">connected</div>
@@ -1643,6 +2838,7 @@ function renderViewer(roomId: string): void {
   nick.value = localStorage.getItem(nickKey) || "";
   const video = qs<HTMLVideoElement>("#remote");
   const compat = qs<HTMLCanvasElement>("#compat");
+  const compatVid = qs<HTMLVideoElement>("#compatVid");
   const err = qs("#err");
   let room: Room | null = null;
   let stopWatch: { stop: () => void; setRtc: (on: boolean) => void } | null = null;
@@ -1650,9 +2846,12 @@ function renderViewer(roomId: string): void {
   let stopStats: (() => void) | null = null;
   let hostVideoPub: RemoteTrackPublication | null = null;
   let rtcLive = false;
+  let rtcGaveUp = false;
+  let showViewers = true;
   let pcmCtx: AudioContext | null = null;
   let pcmGain: GainNode | null = null;
-  let pcmAt = 0;
+  let pcmPlayer: AudioWorkletNode | null = null;
+  let pcmModule: Promise<void> | null = null;
   const pingById = new Map<string, number>();
   const selfId = viewerIdentity();
   let recvBytes = 0;
@@ -1686,6 +2885,9 @@ function renderViewer(roomId: string): void {
         return undefined;
       }
     }
+    if (!compatVid.classList.contains("hidden") && compatVid.videoHeight > 1) {
+      return `compat · ${compatVid.videoHeight}p`;
+    }
     if (!compat.classList.contains("hidden") && compat.width > 1) {
       return `compat · ${compat.height}p`;
     }
@@ -1700,10 +2902,16 @@ function renderViewer(roomId: string): void {
       : [];
     const selfPath: "live" | "compat" | undefined = rtcLive
       ? "live"
-      : !compat.classList.contains("hidden")
+      : !compat.classList.contains("hidden") || !compatVid.classList.contains("hidden")
         ? "compat"
         : undefined;
-    const rows: PersonRow[] = rtcPeople.map((p) => {
+    const rows: PersonRow[] = rtcPeople
+      .filter((p) => {
+        if (showViewers) return true;
+        if (p.identity === "host") return true;
+        return Boolean(room && p === room.localParticipant);
+      })
+      .map((p) => {
       const you = room && p === room.localParticipant ? " (you)" : "";
       const isYou = Boolean(you);
       return {
@@ -1746,33 +2954,74 @@ function renderViewer(roomId: string): void {
     qs("#watch").classList.remove("hidden");
   }
 
+  function promoteRtc(): void {
+    if (rtcGaveUp || rtcLive || video.videoWidth < 2) return;
+    rtcLive = true;
+    pcmPlayer?.port.postMessage({ reset: true });
+    compat.classList.add("hidden");
+    compatVid.classList.add("hidden");
+    document.querySelector("#tapPlay")?.classList.add("hidden");
+    video.classList.remove("hidden");
+    video.controls = true;
+    video.muted = false;
+    video.volume = 1;
+    showWatch();
+    setStatus("live", true);
+    console.info("[ezscreenshare] live WebRTC");
+    stopWatch?.setRtc(true);
+    applyViewerQuality();
+    people();
+  }
+
+  function dropRtc(giveUp: boolean): void {
+    if (giveUp) rtcGaveUp = true;
+    rtcLive = false;
+    video.classList.add("hidden");
+    video.controls = false;
+    stopWatch?.setRtc(false);
+    if (!compat.classList.contains("hidden") || !compatVid.classList.contains("hidden")) {
+      setStatus("compatibility", true);
+    }
+    people();
+    if (giveUp && room) void room.disconnect();
+  }
+
   function attach(track: RemoteTrack, pub: RemoteTrackPublication, participant: RemoteParticipant): void {
     if (participant.identity !== "host") return;
     if (track.kind !== Track.Kind.Video && track.kind !== Track.Kind.Audio) return;
+    // Give audio and video the same low-latency target; never tune one alone.
+    const receiver = track.receiver;
+    try {
+      if (receiver && "jitterBufferTarget" in receiver) {
+        (receiver as RTCRtpReceiver & { jitterBufferTarget: number }).jitterBufferTarget = 100;
+      } else if (receiver && "playoutDelayHint" in receiver) {
+        track.setPlayoutDelay(0.1);
+      }
+    } catch { /* Browser retains its automatic jitter buffer. */ }
     track.attach(video);
-    video.muted = false;
-    video.volume = 1;
     video.playsInline = true;
     video.disablePictureInPicture = false;
-    void video.play().catch(() => undefined);
     if (track.kind === Track.Kind.Audio) {
       try {
         (track as RemoteTrack & { setVolume?: (n: number) => void }).setVolume?.(1);
       } catch {
         /* ignore */
       }
+      if (rtcLive) {
+        video.muted = false;
+        video.volume = 1;
+      }
+      return;
     }
-    if (track.kind === Track.Kind.Video) {
-      hostVideoPub = pub;
-      rtcLive = true;
-      compat.classList.add("hidden");
-      video.classList.remove("hidden");
-      video.controls = true;
-      showWatch();
-      setStatus("live", true);
-      stopWatch?.setRtc(true);
-      applyViewerQuality();
-    }
+    hostVideoPub = pub;
+    applyViewerQuality();
+    const onFrame = (): void => {
+      if (video.videoWidth > 1) promoteRtc();
+    };
+    video.requestVideoFrameCallback?.(onFrame);
+    video.addEventListener("playing", onFrame);
+    video.addEventListener("loadeddata", onFrame);
+    void video.play().catch(() => undefined);
   }
 
   function applyViewerQuality(): void {
@@ -1791,37 +3040,96 @@ function renderViewer(roomId: string): void {
     }
   }
 
+  const volKey = "ezscreenshare.volume";
+
   function sliderGain(): number {
-    return 1;
+    if (rtcLive) {
+      if (video.muted) return 0;
+      return Number.isFinite(video.volume) ? video.volume : 1;
+    }
+    const hud = document.querySelector<HTMLInputElement>("#vol");
+    if (!hud) return 1;
+    return Math.max(0, Math.min(1, Number(hud.value) / 100));
+  }
+
+  function applyVolume(): void {
+    const g = sliderGain();
+    if (pcmGain) pcmGain.gain.value = g;
+    const a = document.querySelector<HTMLAudioElement>("#compatAudio");
+    if (a) {
+      a.volume = g;
+      if (a.dataset.stalled !== "1") a.muted = g === 0;
+    }
+    const hud = document.querySelector<HTMLInputElement>("#vol");
+    if (hud) hud.value = String(Math.round(g * 100));
+    localStorage.setItem(volKey, hud?.value ?? String(Math.round(g * 100)));
+  }
+
+  function setVolumeFromHud(raw: string): void {
+    const n = Math.max(0, Math.min(100, Number(raw) || 0));
+    const g = n / 100;
+    compatVid.muted = true;
+    video.muted = n === 0 && rtcLive;
+    video.volume = g;
+    applyVolume();
   }
 
   function playPcm(rate: number, samples: Int16Array): void {
     if (rtcLive || !samples.length) return;
     pcmCtx ??= new AudioContext({ sampleRate: rate });
-    pcmGain ??= pcmCtx.createGain();
-    pcmGain.connect(pcmCtx.destination);
+    if (!pcmGain) {
+      pcmGain = pcmCtx.createGain();
+      pcmGain.connect(pcmCtx.destination);
+    }
     void pcmCtx.resume();
     pcmGain.gain.value = sliderGain();
-    const f32 = new Float32Array(samples.length);
-    for (let i = 0; i < samples.length; i++) f32[i] = samples[i]! / 32768;
-    const buf = pcmCtx.createBuffer(1, f32.length, rate);
-    buf.copyToChannel(f32, 0);
-    const src = pcmCtx.createBufferSource();
-    src.buffer = buf;
-    src.connect(pcmGain);
-    const now = pcmCtx.currentTime;
-    if (pcmAt - now > 0.35) return;
-    if (pcmAt < now + 0.05) pcmAt = now + 0.05;
-    src.start(pcmAt);
-    pcmAt += buf.duration;
+    if (!pcmPlayer) {
+      pcmModule ??= pcmCtx.audioWorklet.addModule(compatAudioUrl).then(() => {
+        pcmPlayer = new AudioWorkletNode(pcmCtx!, "compat-playback", { outputChannelCount: [1] });
+        pcmPlayer.connect(pcmGain!);
+      }).catch((err) => console.error("[ezscreenshare] audio playback", err));
+      return;
+    }
+    pcmPlayer.port.postMessage({ rate, samples }, [samples.buffer]);
   }
 
   const joinBtn = qs<HTMLButtonElement>("#join");
+  let mediaUnlocked = false;
+  const tapPlay = (): void => {
+    mediaUnlocked = true;
+    document.querySelector("#tapPlay")?.classList.add("hidden");
+    compatVid.muted = true;
+    compatVid.controls = true;
+    void compatVid.play().catch(() => undefined);
+    void document.querySelector<HTMLAudioElement>("#compatAudio")?.play().catch(() => undefined);
+    void video.play().catch(() => undefined);
+    pcmCtx ??= new AudioContext();
+    void pcmCtx.resume();
+  };
+  qs("#tapPlay")?.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    tapPlay();
+  });
+  const savedVol = localStorage.getItem(volKey);
+  if (savedVol != null) setVolumeFromHud(savedVol);
+  qs<HTMLInputElement>("#vol").addEventListener("input", (ev) => {
+    setVolumeFromHud((ev.target as HTMLInputElement).value);
+  });
+  compatVid.addEventListener("volumechange", () => {
+    compatVid.muted = true;
+    applyVolume();
+  });
+  video.addEventListener("volumechange", () => applyVolume());
   qs("#gate").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     err.textContent = "";
     localStorage.setItem(nickKey, nick.value.trim() || "viewer");
     joinBtn.disabled = true;
+    rtcGaveUp = false;
+    rtcLive = false;
+    pcmCtx ??= new AudioContext();
+    void pcmCtx.resume();
     try {
       if (room) {
         await room.disconnect();
@@ -1832,6 +3140,7 @@ function renderViewer(roomId: string): void {
         nickname: nick.value.trim() || "viewer",
         identity: viewerIdentity(),
       });
+      showViewers = joined.showViewers !== false;
       room = new Room(roomOpts("viewer"));
       room.on(RoomEvent.TrackSubscribed, (track, pub, p) => attach(track, pub, p));
       room.on(RoomEvent.TrackPublished, (pub, p) => {
@@ -1839,11 +3148,18 @@ function renderViewer(roomId: string): void {
       });
       room.on(RoomEvent.ParticipantConnected, people);
       room.on(RoomEvent.ParticipantDisconnected, people);
-      room.on(RoomEvent.Disconnected, () => {
-        rtcLive = false;
-        stopWatch?.setRtc(false);
-        if (!compat.classList.contains("hidden")) setStatus("compatibility", true);
+      room.on(RoomEvent.ConnectionStateChanged, (state) => {
+        if (rtcLive || rtcGaveUp) return;
+        if (
+          state === ConnectionState.Reconnecting ||
+          state === ConnectionState.SignalReconnecting
+        ) {
+          dropRtc(false);
+        } else if (state === ConnectionState.Disconnected) {
+          dropRtc(false);
+        }
       });
+      room.on(RoomEvent.Disconnected, () => dropRtc(false));
       stopWatch?.stop();
       stopPing?.();
       pingById.clear();
@@ -1856,12 +3172,17 @@ function renderViewer(roomId: string): void {
       showWatch();
       stopWatch = startWatch(
         compat,
+        compatVid,
         joined.roomId,
         joined.watchToken,
         nick.value.trim() || "viewer",
         viewerIdentity(),
         {
           isRtcLive: () => rtcLive,
+          unlocked: () => mediaUnlocked,
+          markUnlocked: () => {
+            mediaUnlocked = true;
+          },
           onFrame: () => {
             if (!rtcLive) {
               video.classList.add("hidden");
@@ -1871,6 +3192,10 @@ function renderViewer(roomId: string): void {
             }
           },
           onPcm: playPcm,
+          onViewersVisible: (on) => {
+            showViewers = on;
+            people();
+          },
           onRtt: (ms) => {
             pingById.set(selfId, ms);
             const liveId = room?.localParticipant.identity;
@@ -1889,7 +3214,7 @@ function renderViewer(roomId: string): void {
       );
       people();
       void room
-        .connect(joined.livekitUrl, joined.token, { peerConnectionTimeout: 20_000 })
+        .connect(joined.livekitUrl, joined.token, { peerConnectionTimeout: 20_000, maxRetries: 1 })
         .then(() => {
           stopPing?.();
           stopPing = bindRoomPing(room!, room!.localParticipant.identity || selfId, pingById, () =>
@@ -1902,15 +3227,19 @@ function renderViewer(roomId: string): void {
           }
           people();
         })
-        .catch(() => {
-          /* SOCKS/LibreWolf often cannot ICE; HTTP JPEG path is the real viewer. */
+        .catch((error) => {
+          console.info("[ezscreenshare] WebRTC unavailable; continuing compatibility", error);
         });
       window.setTimeout(() => {
-        if (!rtcLive && compat.classList.contains("hidden")) {
+        if (
+          !rtcLive &&
+          compat.classList.contains("hidden") &&
+          compatVid.classList.contains("hidden")
+        ) {
           err.textContent = "waiting for the host stream — keep this page, or join again";
           joinBtn.disabled = false;
         }
-      }, 12_000);
+      }, 8_000);
       joinBtn.disabled = false;
     } catch (e) {
       err.textContent = e instanceof Error ? e.message : String(e);

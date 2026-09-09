@@ -8,6 +8,7 @@ directories:
 files:
   - src/main/**
   - src/preload/**
+  - src/shared/**
   - package.json
   - "!**/node_modules/**"
 extraMetadata:

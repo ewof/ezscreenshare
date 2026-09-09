@@ -1,3 +1,4 @@
+import { normalizeAudioSelection, includesAudioApp, audioSelectionLabel } from "../shared/audio-selection.mjs";
 import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, Menu, session } from "electron";
 import { execFile } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -68,7 +69,10 @@ function registerCapture() {
     }
     // Video only here. Linux loopback is a no-op; system audio is the PipeWire
     // sink monitor added in the renderer via getUserMedia.
-    callback({ video: { id: chosen.id, name: chosen.name } });
+    callback({
+      video: { id: chosen.id, name: chosen.name },
+      ...(process.platform === "win32" && capture.audio ? { audio: "loopback" } : {}),
+    });
   });
 }
 
@@ -98,6 +102,11 @@ ipcMain.handle("ez:setCapture", (_e, id, audio) => {
   capture = { id, audio: Boolean(audio) };
 });
 
+ipcMain.handle("ez:setCaptureAudio", (_e, on) => {
+  armMedia();
+  capture.audio = Boolean(on);
+});
+
 function pactl(args) {
   return new Promise((resolve) => {
     execFile("pactl", args, { timeout: 2500 }, (err, stdout) => {
@@ -107,6 +116,7 @@ function pactl(args) {
 }
 
 ipcMain.handle("ez:monitorHint", async () => {
+  if (process.platform !== "linux") return "";
   const sink = (await pactl(["get-default-sink"])).trim();
   if (!sink) return "";
   const list = await pactl(["list", "sources"]);
@@ -125,7 +135,8 @@ ipcMain.handle("ez:copyText", (_e, text) => {
 
 const TAP = "ezs-tap";
 const VIRT = "ezs-virt";
-const SKIP_APP = /speech-dispatcher|pipewire|pulseaudio|ezscreenshare|loopback/i;
+const SKIP_APP =
+  /^(?:speech-dispatcher|pipewire|pulseaudio|ezscreenshare|electron|loopback)$/i;
 let tap = { sinkMod: "", loopMod: "", remapMod: "", remapMaster: "", moved: [], hearSink: "", wanted: "" };
 
 function unquote(s) {
@@ -246,7 +257,41 @@ async function unloadMatchingModules(needle, keepId) {
   }
 }
 
+let audioRoutingTimer = null;
+let audioRoutingBusy = false;
+let tapSelection = null;
+let audioOperations = Promise.resolve();
+function serializeAudio(operation) {
+  const next = audioOperations.then(operation, operation);
+  audioOperations = next.catch(() => {});
+  return next;
+}
+
+async function refreshAudioRouting() {
+  if (!tapSelection || audioRoutingBusy) return;
+  audioRoutingBusy = true;
+  try {
+    const inputs = parseSinkInputs(await pactl(["list", "sink-inputs"]));
+    const activeIds = new Set(inputs.map(input => input.index));
+    tap.moved = tap.moved.filter(moved => activeIds.has(moved.index));
+    for (const input of inputs) {
+      if (!includesAudioApp(tapSelection, input.app)) continue;
+      if (tap.moved.some(moved => moved.index === input.index)) continue;
+      let original = await sinkIdToName(input.sink || tap.hearSink);
+      if (original === TAP || original.includes(TAP)) original = tap.hearSink;
+      await pactl(["move-sink-input", input.index, TAP]);
+      tap.moved.push({ index: input.index, sink: original });
+    }
+  } finally {
+    audioRoutingBusy = false;
+  }
+}
+
 async function teardownTap() {
+  if (process.platform !== "linux") return;
+  clearInterval(audioRoutingTimer);
+  audioRoutingTimer = null;
+  tapSelection = null;
   const hear = tap.hearSink;
   await restoreMoved();
   await pinHearSink(hear);
@@ -326,6 +371,9 @@ async function ensureVirt(masterMonitor) {
 }
 
 ipcMain.handle("ez:listAudioSources", async () => {
+  if (process.platform !== "linux") {
+    return [{ id: "system", label: "Entire system", monitor: true, running: true }];
+  }
   const inputs = parseSinkInputs(await pactl(["list", "sink-inputs"]));
   const byApp = new Map();
   for (const inp of inputs) {
@@ -345,59 +393,45 @@ ipcMain.handle("ez:listAudioSources", async () => {
   return [{ id: "system", label: "Entire system", monitor: true, running: true }, ...apps];
 });
 
-ipcMain.handle("ez:beginMonitorCapture", async (_e, sourceId) => {
+ipcMain.handle("ez:beginMonitorCapture", (_e, selection) => serializeAudio(async () => {
+  if (process.platform !== "linux") return { ok: false, prev: "", label: "" };
   armMedia();
   const sink = await realHearSink();
-  const wanted = String(sourceId || "system").trim();
-  if (wanted === "none" || !sink) return { ok: false, prev: "", label: "" };
-
-  const appName = wanted.startsWith("app:") ? wanted.slice(4) : "";
-  const reuse = tap.wanted === wanted && tap.moved.length > 0 && tap.remapMod;
-  if (!reuse) {
-    await restoreMoved();
-    await ensureTap(sink);
-    await ensureVirt(`${TAP}.monitor`);
-    await pactl(["set-sink-mute", TAP, "1"]);
-    await setHearMute(true);
-    await pinHearSink(sink);
-    const inputs = parseSinkInputs(await pactl(["list", "sink-inputs"]));
-    for (const inp of inputs) {
-      if (appName && inp.app !== appName) continue;
-      let orig = await sinkIdToName(inp.sink || sink);
-      if (orig === TAP || orig.includes(TAP)) orig = sink;
-      await pactl(["move-sink-input", inp.index, TAP]);
-      tap.moved.push({ index: inp.index, sink: orig });
-    }
-    tap.wanted = wanted;
-    await sleep(120);
-    await pactl(["set-sink-mute", TAP, "0"]);
-    await setHearMute(false);
-    await pinHearSink(sink);
-  } else {
-    await ensureTap(sink);
-    await ensureVirt(`${TAP}.monitor`);
-    await pactl(["set-sink-mute", TAP, "0"]);
-    await setHearMute(false);
-    await pinHearSink(sink);
-  }
-  if (appName && !tap.moved.length) {
-    console.warn("[ezs] no sink-input for", appName);
-    tap.wanted = "";
+  const wanted = normalizeAudioSelection(selection);
+  clearInterval(audioRoutingTimer);
+  audioRoutingTimer = null;
+  await restoreMoved();
+  tapSelection = wanted;
+  if (!sink || (wanted.mode === "include" && !wanted.apps.length)) {
+    await teardownTap();
     return { ok: false, prev: "", label: "" };
   }
+  await ensureTap(sink);
+  await ensureVirt(`${TAP}.monitor`);
+  if (!tap.remapMod || !tap.loopMod) {
+    await teardownTap();
+    return { ok: false, prev: "", label: "" };
+  }
+  await refreshAudioRouting();
+  await pactl(["set-sink-mute", TAP, "0"]);
+  await setHearMute(false);
+  await pinHearSink(sink);
+  // New tracks (including restarted players) inherit the selection too.
+  audioRoutingTimer = setInterval(() => {
+    void serializeAudio(refreshAudioRouting);
+  }, 1000);
+  audioRoutingTimer.unref();
   return {
-    ok: Boolean(tap.remapMod),
-    prev: "",
-    label: appName || "Entire system",
+    ok: Boolean(tap.remapMod), prev: "", label: audioSelectionLabel(wanted),
     hints: ["ezscreenshare", "Monitor of ezscreenshare"],
   };
-});
+}));
 
 ipcMain.handle("ez:endMonitorCapture", async () => {
   /* Default source is left alone so the headset does not click. */
 });
 
-ipcMain.handle("ez:releaseAudioTap", () => teardownTap());
+ipcMain.handle("ez:releaseAudioTap", () => serializeAudio(teardownTap));
 
 ipcMain.handle("ez:getServerUrl", () => serverUrl());
 
@@ -434,6 +468,7 @@ async function createWindow() {
     webPreferences: {
       preload: join(here, "../preload/preload.mjs"),
       contextIsolation: true,
+      backgroundThrottling: false,
       nodeIntegration: false,
       // Sandbox + ESM preload does not load (window.ez missing). Linux
       // desktopCapturer/PipeWire also returns no sources in a sandboxed renderer.
@@ -494,11 +529,14 @@ app.whenReady().then(async () => {
   });
 });
 
-app.on("before-quit", () => {
-  void teardownTap();
+let finishingQuit = false;
+app.on("before-quit", (event) => {
+  if (process.platform !== "linux" || finishingQuit) return;
+  event.preventDefault();
+  finishingQuit = true;
+  void serializeAudio(teardownTap).finally(() => app.quit());
 });
 
 app.on("window-all-closed", () => {
-  void teardownTap();
   if (process.platform !== "darwin") app.quit();
 });

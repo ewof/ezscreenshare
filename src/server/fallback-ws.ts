@@ -48,7 +48,7 @@ export function acceptWebsocket(
   );
   if (head.length) socket.unshift(head);
 
-  let buf = Buffer.alloc(0);
+  let buf: Buffer = Buffer.alloc(0);
   let ready = true;
   let fragOp = 0;
   let frag: Buffer[] = [];
@@ -75,9 +75,22 @@ export function acceptWebsocket(
     send(data) {
       if (!ready) return;
       const isString = typeof data === "string";
-      // Never queue stale JPEGs/PCM behind a slow viewer (that is the 10s lag).
-      if (!isString && socket.writableLength > 256_000) return;
       const payload = isString ? Buffer.from(data) : data;
+      // Drop oversized live media when the kernel buffer is already full, but
+      // always let tiny cfg/init packets through (MSE cannot recover without them).
+      // Dropping WebM clusters makes Firefox MSE stutter; allow a larger
+      // kernel buffer for EZSW and only drop other media when the socket is full.
+      const webm =
+        !isString &&
+        payload.length >= 5 &&
+        payload[0] === 0x45 &&
+        payload[1] === 0x5a &&
+        payload[2] === 0x53 &&
+        payload[3] === 0x57;
+      if (!isString && payload.length > 4096) {
+        if (webm && socket.writableLength > 2_000_000) return;
+        if (!webm && socket.writableLength > 768_000) return;
+      }
       socket.write(encodeFrame(isString ? 1 : 2, payload));
     },
     ping() {

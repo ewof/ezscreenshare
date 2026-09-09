@@ -13,6 +13,7 @@ export type CreateRoomRequest = {
   password: string;
   hostPassword: string;
   forceTcp: boolean;
+  showViewers: boolean;
   nickname: string;
 };
 
@@ -22,6 +23,7 @@ export type CreateRoomResponse = {
   livekitUrl: string;
   publicUrl: string;
   forceTcp: boolean;
+  showViewers: boolean;
   iceServers: IceInfo[];
   ingestToken: string;
 };
@@ -36,6 +38,7 @@ export type JoinRoomResponse = {
   token: string;
   livekitUrl: string;
   forceTcp: boolean;
+  showViewers: boolean;
   iceServers: IceInfo[];
   watchToken: string;
 };

@@ -18,7 +18,7 @@ Built for a small group that actually has to work: a Linux host, a Mac, an iPhon
 - **Viewers** get a link. Any current browser. They set a nickname and watch.
 - You can change source, resolution, and FPS without minting a new link.
 - Force TCP is on by default so media does not depend on random UDP.
-- If WebRTC cannot connect (common with locked-down Firefox + SOCKS), a TCP fallback still shows the screen and plays sound. Status says `compatibility` instead of `live`. That is intentional, not a failure. Video is VP8 over the websocket (WebCodecs); audio is PCM on the same socket. Viewers that cannot decode VP8 get JPEG stills instead.
+- If WebRTC cannot connect (common with locked-down Firefox + SOCKS), a TCP fallback still shows the screen and plays sound. Status says `compatibility` instead of `live`. That is intentional, not a failure. Video is VP8 over the websocket (WebCodecs, or WebM/MSE in LibreWolf); audio uses Opus where supported and PCM otherwise. Viewers that cannot decode VP8 get JPEG stills instead.
 
 ## What we prioritized
 
@@ -43,7 +43,13 @@ H.264 for Safari, a player that is allowed to autoplay after you tap Join. If ce
 ## Hosting
 
 **Desktop app (Linux, also buildable for Windows/macOS)**  
-Best default. Pick a screen or window, pick “Entire system” or a running app for audio, start, copy the link. PipeWire (`pactl`) is required for that audio path.
+Best default. Pick a screen or window, choose audio sources, start, copy the link.
+
+On Linux, the audio picker supports multiple running apps through PipeWire (`pactl`). Uncheck “Entire system” to select individual apps such as Spotify and mpv. Or leave “Entire system” checked and uncheck Mumble to capture everything except Mumble, including apps that start playing later. Closing the app or stopping capture restores the original audio outputs.
+
+On Windows, “Entire system” uses native loopback audio. Per-application selection is currently Linux-only. The Windows fix requires the updated Electron main/preload files, not just a refreshed webpage.
+
+After an update, restart the desktop host and hard-refresh browser hosts and viewers. Already-open host pages continue running their old encoder until reloaded.
 
 **Website in Chromium/Brave**  
 Fine for sharing a **tab**. Audio is whatever the browser picker offers (“Share tab audio”). Window/screen audio still wants the desktop app. The in-page audio checkbox and source dropdown are hidden here on purpose — they do not do anything the picker does not already do.
@@ -90,6 +96,16 @@ Friends who only watch do not need the zip. Friends who want to host: send the s
 pnpm dist:win    # on Windows
 pnpm dist:mac    # on macOS
 ```
+
+## Checks
+
+```bash
+pnpm test
+pnpm check
+pnpm build
+```
+
+Compatibility playback uses a bounded jitter buffer and reports stalls to the host so it can reduce video bitrate on a slow path. WebRTC audio and video use the same stream group and receiver buffering target where supported. Actual long-distance latency still depends on the route and available bandwidth.
 
 ## Repo layout
 

@@ -61,6 +61,7 @@ code, .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
   display: flex;
   flex-direction: column;
   min-height: 0;
+  overflow-x: hidden;
 }
 .top {
   display: flex; align-items: center; justify-content: space-between;
@@ -76,8 +77,10 @@ code, .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
   border-radius: 12px;
   padding: 18px;
 }
-.row { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: center; margin: 10px 0; }
-label.field { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; flex: 1; min-width: 140px; }
+.row { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: center; margin: 10px 0; min-width: 0; }
+label.field { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; flex: 1 1 140px; min-width: 0; }
+label.field > input,
+label.field > select { width: 100%; min-width: 0; }
 label.check { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 14px; }
 input[type="text"], input[type="password"], select, button {
   font-size: 16px;
@@ -90,6 +93,7 @@ input:focus, select:focus { border-color: var(--focus); }
 .btn {
   background: var(--accent); color: var(--btn-text); border: 0; border-radius: 8px;
   padding: 9px 14px; font-weight: 650;
+  white-space: nowrap; flex-shrink: 0; line-height: 1.2;
 }
 .btn.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); }
 .btn.copied { background: var(--ok); color: #2e3440; border-color: transparent; }
@@ -146,29 +150,98 @@ input:focus, select:focus { border-color: var(--focus); }
 .source figcaption { padding: 6px 8px; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .stage { position: relative; background: var(--stage); border-radius: 12px; overflow: hidden; min-height: 240px; }
+.stage:fullscreen,
+.stage:-webkit-full-screen {
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+  background: #000;
+}
+.stage:fullscreen video,
+.stage:fullscreen canvas,
+.stage:-webkit-full-screen video,
+.stage:-webkit-full-screen canvas {
+  max-height: 100%;
+  height: 100%;
+  width: 100%;
+  object-fit: contain;
+}
+.stage audio { position: absolute; width: 0; height: 0; opacity: 0; pointer-events: none; }
 .stage video, .stage canvas.compat {
   width: 100%; display: block; max-height: calc(100vh - 160px); background: var(--stage); object-fit: contain;
 }
-.stage canvas.compat:not(.hidden) {
+.stage canvas.compat:not(.hidden),
+.stage video.compat:not(.hidden) {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
 }
+.tap-play {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  margin: 0;
+  border: 0;
+  border-radius: 12px;
+  background: rgb(46 52 64 / 0.72);
+  color: var(--text);
+  font: inherit;
+  font-weight: 650;
+}
 .hud {
-  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   margin-top: 12px;
+  min-width: 0;
+}
+.hud-status,
+.hud-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+.hud-actions .check { font-size: 13px; }
+.hud-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+.hud-field select {
+  font-size: 14px;
+  padding: 6px 10px;
+}
+.hud-field input[type="range"] {
+  width: 96px;
+  accent-color: var(--accent);
 }
 .pill {
   background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px;
   padding: 4px 10px; font-size: 12px; color: var(--muted);
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .pill.live { color: #eceff4; background: var(--live); border-color: transparent; }
 .pill.stats { font-variant-numeric: tabular-nums; }
 .btn.stats-on { border-color: var(--accent); color: var(--accent); }
-.hud label.field { min-width: 88px; flex: 0 0 auto; }
-.linkbox { display: flex; gap: 8px; flex: 1; min-width: 200px; }
-.linkbox input { flex: 1; }
+.linkbox {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+  width: 100%;
+  min-width: 0;
+}
+.linkbox input {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .people-panel {
   margin-top: 14px;
@@ -197,6 +270,10 @@ input:focus, select:focus { border-color: var(--focus); }
 input[type="range"] { accent-color: var(--accent); width: 140px; }
 
 .hidden { display: none !important; }
+.audio-picker { position: relative; min-width: 260px; max-width: 420px; }
+.audio-picker summary { padding: 9px 12px; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+.audio-options { display: flex; flex-direction: column; gap: 8px; max-height: 260px; overflow-y: auto; padding: 12px; border: 1px solid var(--line); border-radius: 6px; }
+.audio-options label { cursor: pointer; overflow-wrap: anywhere; }
 .live-sources { margin-top: 12px; }
 /* JPEG fallback needs a decoding <video>; keep it out of layout. Inline
    style="" is blocked by style-src 'self'. */

@@ -1,3 +1,4 @@
+import type { Socket } from "node:net";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes, timingSafeEqual, scryptSync, createHash } from "node:crypto";
 import { readFileSync, existsSync, statSync, watchFile } from "node:fs";
@@ -6,11 +7,56 @@ import { fileURLToPath } from "node:url";
 import { AccessToken, RoomServiceClient } from "livekit-server-sdk";
 import { acceptWebsocket, type WsClient } from "./fallback-ws.ts";
 
-type Watcher = { ws: WsClient; name: string; id: string; rtt?: number; rtc?: boolean; jpeg?: boolean };
+type Watcher = {
+  ws: WsClient;
+  name: string;
+  id: string;
+  rtt?: number;
+  rtc?: boolean;
+  jpeg?: boolean;
+  mse?: boolean;
+  pcm?: boolean;
+  lastPlaybackAt?: number;
+};
+
+function vidKind(data: Buffer): number | null {
+  if (
+    data.length < 5 ||
+    data[0] !== 0x45 ||
+    data[1] !== 0x5a ||
+    data[2] !== 0x53 ||
+    data[3] !== 0x56
+  ) {
+    return null;
+  }
+  return data[4]!;
+}
+
+function webKind(data: Buffer): number | null {
+  if (
+    data.length < 5 ||
+    data[0] !== 0x45 ||
+    data[1] !== 0x5a ||
+    data[2] !== 0x53 ||
+    data[3] !== 0x57
+  ) {
+    return null;
+  }
+  return data[4]!;
+}
 
 function sendMedia(rec: RoomRecord, data: Buffer): void {
+  const kind = vidKind(data);
+  const wk = webKind(data);
   for (const w of rec.watchers) {
     if (w.rtc) continue;
+    // Mixed viewer capabilities must not play both PCM and decoded Opus.
+    const magic = data.toString("ascii", 0, 4);
+    if (magic === "EZSA" && !w.pcm) continue;
+    if (magic === "EZSO" && w.pcm) continue;
+    if (kind === 5 && !w.jpeg) continue;
+    if ((kind === 0 || kind === 3) && (w.jpeg || w.mse)) continue;
+    if (wk != null && !w.mse) continue;
     w.ws.send(data);
   }
 }
@@ -24,6 +70,12 @@ type RoomRecord = {
   ingest: WsClient | null;
   watchers: Set<Watcher>;
   lastInit: Buffer | null;
+  lastAudio: Buffer | null;
+  lastWebmCfg: Buffer | null;
+  lastWebmInit: Buffer | null;
+  lastAwebmCfg: Buffer | null;
+  lastAwebmInit: Buffer | null;
+  showViewers: boolean;
   gcAt: number;
 };
 
@@ -241,6 +293,11 @@ function freshToken(): string {
   return randomBytes(18).toString("base64url");
 }
 
+function notifyRoster(rec: RoomRecord): void {
+  const msg = JSON.stringify({ t: "viewersVisible", on: rec.showViewers });
+  for (const w of rec.watchers) w.ws.send(msg);
+}
+
 function notifyHost(rec: RoomRecord): void {
   rec.ingest?.send(
     JSON.stringify({
@@ -250,10 +307,24 @@ function notifyHost(rec: RoomRecord): void {
         id: w.id,
         rtt: w.rtt,
         jpeg: w.jpeg,
+        mse: Boolean(w.mse),
+        pcm: Boolean(w.pcm),
         rtc: Boolean(w.rtc),
       })),
     }),
   );
+}
+
+function pushWebmInit(rec: RoomRecord, ws: WsClient): void {
+  if (rec.lastWebmCfg) ws.send(rec.lastWebmCfg);
+  if (rec.lastWebmInit) ws.send(rec.lastWebmInit);
+  if (rec.lastAwebmCfg) ws.send(rec.lastAwebmCfg);
+  if (rec.lastAwebmInit) ws.send(rec.lastAwebmInit);
+  if (rec.lastAudio) ws.send(rec.lastAudio);
+}
+
+function requestWebmRestart(rec: RoomRecord): void {
+  rec.ingest?.send(JSON.stringify({ t: "webmRestart" }));
 }
 
 async function mintToken(opts: {
@@ -304,8 +375,20 @@ function isVidCfg(data: Buffer): boolean {
   );
 }
 
+function isOpusCfg(data: Buffer): boolean {
+  return (
+    data.length >= 5 &&
+    data[0] === 0x45 &&
+    data[1] === 0x5a &&
+    data[2] === 0x53 &&
+    data[3] === 0x4f &&
+    data[4] === 0
+  );
+}
+
 function pushFrame(rec: RoomRecord, frame: Buffer): void {
   if (isVidCfg(frame)) rec.lastInit = frame;
+  if (isOpusCfg(frame)) rec.lastAudio = frame;
   sendMedia(rec, frame);
 }
 
@@ -333,12 +416,15 @@ function serveStatic(reqPath: string, res: ServerResponse): boolean {
     const fallback = join(WEB_DIR, "index.html");
     if (!existsSync(fallback)) return false;
     applySecHeaders(res, true);
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
     res.end(readFileSync(fallback));
     return true;
   }
   const html = extname(file) === ".html";
   applySecHeaders(res, html);
+  // Navigation must fetch the current asset manifest after a deployment.
+  // This does not replace code in an already-open host tab: reload that tab.
+  if (html) res.setHeader("cache-control", "no-store");
   res.writeHead(200, { "content-type": MIME[extname(file)] ?? "application/octet-stream" });
   res.end(readFileSync(file));
   return true;
@@ -384,6 +470,7 @@ const server = createServer(async (req, res) => {
         password?: string;
         hostPassword?: string;
         forceTcp?: boolean;
+        showViewers?: boolean;
         nickname?: string;
       };
       if (!hostPassword && process.env.NODE_ENV === "production") {
@@ -397,6 +484,7 @@ const server = createServer(async (req, res) => {
       const id = roomId();
       const password = (body.password ?? "").trim();
       const forceTcp = Boolean(body.forceTcp);
+      const showViewers = body.showViewers !== false;
       const nickname = (body.nickname ?? "host").trim().slice(0, 32) || "host";
       const ingestToken = freshToken();
       rooms.set(id, {
@@ -409,6 +497,12 @@ const server = createServer(async (req, res) => {
         ingest: null,
         watchers: new Set(),
         lastInit: null,
+        lastAudio: null,
+        lastWebmCfg: null,
+        lastWebmInit: null,
+        lastAwebmCfg: null,
+        lastAwebmInit: null,
+        showViewers,
         gcAt: 0,
       });
       try {
@@ -437,6 +531,7 @@ const server = createServer(async (req, res) => {
           livekitUrl: LIVEKIT_WS_URL,
           publicUrl: `${PUBLIC_URL}/r/${id}`,
           forceTcp,
+          showViewers,
           iceServers: iceServers(forceTcp),
           ingestToken,
         },
@@ -545,6 +640,7 @@ const server = createServer(async (req, res) => {
           token,
           livekitUrl: LIVEKIT_WS_URL,
           forceTcp: rec.forceTcp,
+          showViewers: rec.showViewers,
           iceServers: iceServers(rec.forceTcp),
           watchToken,
         },
@@ -592,11 +688,32 @@ server.on("upgrade", (req, socket, head) => {
     }
     rec.ingest?.close();
     let ingestWs: WsClient | null = null;
-    ingestWs = acceptWebsocket(req, socket, head, {
+    ingestWs = acceptWebsocket(req, socket as Socket, head, {
       onMessage(data, isBinary) {
-        if (!isBinary) return;
+        if (!isBinary) {
+          try {
+            const msg = JSON.parse(data.toString()) as { t?: string; on?: boolean };
+            if (msg.t === "viewersVisible") {
+              rec.showViewers = Boolean(msg.on);
+              notifyRoster(rec);
+            }
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
         if (data.length > 1_500_000) return;
         if (isVidCfg(data)) rec.lastInit = data;
+        if (isOpusCfg(data)) rec.lastAudio = data;
+        const wk = webKind(data);
+        if (wk === 0) {
+          rec.lastWebmCfg = data;
+          rec.lastWebmInit = null;
+        } else if (wk === 1 && !rec.lastWebmInit) rec.lastWebmInit = data;
+        else if (wk === 2) {
+          rec.lastAwebmCfg = data;
+          rec.lastAwebmInit = null;
+        } else if (wk === 3 && !rec.lastAwebmInit) rec.lastAwebmInit = data;
         sendMedia(rec, data);
       },
       onClose() {
@@ -623,7 +740,7 @@ server.on("upgrade", (req, socket, head) => {
       return;
     }
     let watcher: Watcher | null = null;
-    const ws = acceptWebsocket(req, socket, head, {
+    const ws = acceptWebsocket(req, socket as Socket, head, {
       onMessage(data, isBinary) {
         if (isBinary || !watcher) return;
         try {
@@ -635,14 +752,36 @@ server.on("upgrade", (req, socket, head) => {
             ms?: number;
             on?: boolean;
             jpeg?: boolean;
+            mse?: boolean;
+            pcm?: boolean;
+            stalls?: number;
           };
           if (msg.t === "hello") {
             if (typeof msg.name === "string") watcher.name = msg.name.trim().slice(0, 32) || watcher.name;
             if (typeof msg.id === "string") watcher.id = msg.id.trim().slice(0, 64);
             watcher.jpeg = Boolean(msg.jpeg);
+            watcher.mse = Boolean(msg.mse);
+            watcher.pcm = Boolean(msg.pcm);
             notifyHost(rec);
+            if (watcher.mse && !watcher.rtc) {
+              requestWebmRestart(rec);
+              pushWebmInit(rec, watcher.ws);
+            }
+          } else if (msg.t === "playback" && watcher.mse && !watcher.rtc &&
+                     typeof msg.stalls === "number" && Number.isFinite(msg.stalls)) {
+            const now = Date.now();
+            if (now - (watcher.lastPlaybackAt || 0) >= 4000) {
+              watcher.lastPlaybackAt = now;
+              rec.ingest?.send(JSON.stringify({ t: "playback", id: watcher.id || watcher.name,
+                stalls: Math.max(0, Math.min(100, Math.round(msg.stalls))) }));
+            }
+          } else if (msg.t === "needInit") {
+            requestWebmRestart(rec);
+            pushWebmInit(rec, watcher.ws);
           } else if (msg.t === "rtc") {
             watcher.rtc = Boolean(msg.on);
+            notifyHost(rec);
+            if (!watcher.rtc && watcher.mse) requestWebmRestart(rec);
           } else if (msg.t === "ping") {
             watcher.ws.send(JSON.stringify({ t: "pong", n: msg.n }));
           } else if (msg.t === "rtt" && typeof msg.ms === "number" && Number.isFinite(msg.ms)) {
@@ -662,8 +801,13 @@ server.on("upgrade", (req, socket, head) => {
     if (ws) {
       watcher = { ws, name: "viewer", id: "" };
       rec.watchers.add(watcher);
-      ws.send(JSON.stringify({ t: "hello", hasHost: Boolean(rec.ingest) }));
+      ws.send(JSON.stringify({ t: "hello", hasHost: Boolean(rec.ingest), showViewers: rec.showViewers }));
       if (rec.lastInit) ws.send(rec.lastInit);
+      if (rec.lastAudio) ws.send(rec.lastAudio);
+      if (rec.lastWebmCfg) ws.send(rec.lastWebmCfg);
+      if (rec.lastWebmInit) ws.send(rec.lastWebmInit);
+      if (rec.lastAwebmCfg) ws.send(rec.lastAwebmCfg);
+      if (rec.lastAwebmInit) ws.send(rec.lastAwebmInit);
       notifyHost(rec);
     }
     return;

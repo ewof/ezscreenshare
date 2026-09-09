@@ -9,20 +9,23 @@
     "dev:web": "vite --config vite.config.ts",
     "dev:api": "node --experimental-strip-types src/server/index.ts",
     "dev": "concurrently -k -n livekit,api,web -c blue,green,magenta \"docker compose up --no-color livekit\" \"node --experimental-strip-types src/server/index.ts\" \"vite --config vite.config.ts\"",
-    "electron:dev": "wait-on -t 30000 -v http-get://127.0.0.1:8787/health http-get://127.0.0.1:5173 && ELECTRON_DEV=1 electron .",
-    "electron:prod": "electron .",
+    "electron:dev": "wait-on -t 30000 -v http-get://127.0.0.1:8787/health http-get://127.0.0.1:5173 && node scripts/ensure-electron.mjs && pnpm build:native && ELECTRON_DEV=1 electron .",
+    "electron:prod": "node scripts/ensure-electron.mjs && pnpm build:native && electron .",
     "build": "vite build --config vite.config.ts",
     "start": "node --experimental-strip-types src/server/index.ts",
     "dist:linux": "pnpm build && electron-builder --linux dir zip AppImage",
     "install:local": "bash scripts/install-local.sh",
     "dist:win": "pnpm build && electron-builder --win nsis",
-    "dist:mac": "pnpm build && electron-builder --mac dmg",
+    "dist:mac": "pnpm build && pnpm build:native && electron-builder --mac dmg",
     "test": "node --experimental-strip-types --test scripts/*.test.mjs",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "build:native": "node scripts/build-native.mjs",
+    "test:mac": "node scripts/macos-capture.integration.mjs"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
       "electron",
+      "electron-winstaller",
       "esbuild"
     ]
   },

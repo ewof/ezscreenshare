@@ -8,3 +8,4 @@ config/livekit.prod.yaml
 .DS_Store
 certs/
 turn-certs/*.pem
+.pnpm-store/

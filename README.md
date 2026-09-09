@@ -47,7 +47,11 @@ Best default. Pick a screen or window, choose audio sources, start, copy the lin
 
 On Linux, the audio picker supports multiple running apps through PipeWire (`pactl`). Uncheck “Entire system” to select individual apps such as Spotify and mpv. Or leave “Entire system” checked and uncheck Mumble to capture everything except Mumble, including apps that start playing later. Closing the app or stopping capture restores the original audio outputs.
 
-On Windows, “Entire system” uses native loopback audio. Per-application selection is currently Linux-only. The Windows fix requires the updated Electron main/preload files, not just a refreshed webpage.
+On macOS 13+, the desktop app captures application audio through ScreenCaptureKit, without a virtual audio driver. Pick any available screen or window independently of audio: select several apps, or use “Entire system” and uncheck apps to exclude them. Selection is per application, so multiple windows/tabs of the same app share its audio selection. The app list includes running apps even if they are currently silent. App selections survive restarts. Microphone/input-device mixing is not included in this picker.
+
+Allow **Screen & System Audio Recording** in macOS System Settings, then quit and reopen the host. When launched from a terminal, macOS may attribute permission to the terminal (such as iTerm) instead. Permission denial is shown as a capture error. Protected content and windows macOS does not expose cannot be captured.
+
+On Windows, “Entire system” uses native loopback audio. Per-application selection is available on Linux and macOS. The Windows fix requires the updated Electron main/preload files, not just a refreshed webpage.
 
 After an update, restart the desktop host and hard-refresh browser hosts and viewers. Already-open host pages continue running their old encoder until reloaded.
 
@@ -94,8 +98,10 @@ Friends who only watch do not need the zip. Friends who want to host: send the s
 
 ```bash
 pnpm dist:win    # on Windows
-pnpm dist:mac    # on macOS
+pnpm dist:mac    # on macOS (requires Xcode Command Line Tools)
 ```
+
+For a source checkout on macOS, `pnpm electron:prod` restores a missing Electron runtime and builds the native helper before opening the app. Install Xcode Command Line Tools (`xcode-select --install`) if Swift is unavailable. Packaged apps include the helper and do not need developer tools. The helper is built for the current machine’s architecture. The production app loads its interface from the saved server URL, so deploy the updated `dist/web` and restart the desktop app together.
 
 ## Checks
 
@@ -103,6 +109,7 @@ pnpm dist:mac    # on macOS
 pnpm test
 pnpm check
 pnpm build
+pnpm test:mac  # optional macOS hardware test; plays two quiet test tones
 ```
 
 Compatibility playback uses a bounded jitter buffer and reports stalls to the host so it can reduce video bitrate on a slow path. WebRTC audio and video use the same stream group and receiver buffering target where supported. Actual long-distance latency still depends on the route and available bandwidth.

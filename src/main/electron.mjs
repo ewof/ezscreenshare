@@ -1,3 +1,4 @@
+import { MacAudio } from "./macos-audio.mjs";
 import { normalizeAudioSelection, includesAudioApp, audioSelectionLabel } from "../shared/audio-selection.mjs";
 import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, Menu, session } from "electron";
 import { execFile } from "node:child_process";
@@ -47,6 +48,13 @@ function serverUrl() {
 app.commandLine.appendSwitch("ozone-platform-hint", "auto");
 app.commandLine.appendSwitch("enable-features", "WebRTCPipeWireCapturer,LoopbackWaveIn");
 
+let macAudio;
+function getMacAudio() {
+  return macAudio ??= new MacAudio(app.isPackaged
+    ? join(process.resourcesPath, "native/macos-audio")
+    : join(here, "../../dist/native/macos-audio"));
+}
+
 let capture = { id: "", audio: true };
 let win;
 let mediaArmedUntil = 0;
@@ -56,13 +64,16 @@ function armMedia() {
 
 function registerCapture() {
   session.defaultSession.setDisplayMediaRequestHandler(async (_req, callback) => {
-    const sources = await desktopCapturer.getSources({
-      types: ["screen", "window"],
-      thumbnailSize: { width: 1, height: 1 },
-    });
+    let sources;
+    try {
+      sources = await desktopCapturer.getSources({ types: ["screen", "window"], thumbnailSize: { width: 1, height: 1 } });
+    } catch (error) {
+      console.error("[ezs] capture", error);
+      callback({});
+      return;
+    }
     const chosen =
-      sources.find((s) => s.id === capture.id) ||
-      sources[0];
+      capture.id ? sources.find((s) => s.id === capture.id) : sources[0];
     if (!chosen) {
       callback({});
       return;
@@ -288,6 +299,7 @@ async function refreshAudioRouting() {
 }
 
 async function teardownTap() {
+  macAudio?.stop();
   if (process.platform !== "linux") return;
   clearInterval(audioRoutingTimer);
   audioRoutingTimer = null;
@@ -371,6 +383,10 @@ async function ensureVirt(masterMonitor) {
 }
 
 ipcMain.handle("ez:listAudioSources", async () => {
+  if (process.platform === "darwin") return [
+    { id: "system", label: "Entire system", monitor: true, running: true },
+    ...(await getMacAudio().list()).sort((a, b) => a.label.localeCompare(b.label)),
+  ];
   if (process.platform !== "linux") {
     return [{ id: "system", label: "Entire system", monitor: true, running: true }];
   }
@@ -427,6 +443,12 @@ ipcMain.handle("ez:beginMonitorCapture", (_e, selection) => serializeAudio(async
   };
 }));
 
+ipcMain.handle("ez:beginMacAudio", (event, selection) => {
+  if (process.platform !== "darwin") throw new Error("macOS audio is unavailable on this platform.");
+  armMedia();
+  return getMacAudio().start(selection, event.sender);
+});
+
 ipcMain.handle("ez:endMonitorCapture", async () => {
   /* Default source is left alone so the headset does not click. */
 });
@@ -478,6 +500,11 @@ async function createWindow() {
       allowRunningInsecureContent: false,
     },
   });
+  win.webContents.on("did-start-navigation", (_event, _url, inPlace, mainFrame) => {
+    if (mainFrame && !inPlace) void serializeAudio(teardownTap);
+  });
+  win.on("closed", () => { void serializeAudio(teardownTap); });
+  win.webContents.on("render-process-gone", () => { void serializeAudio(teardownTap); });
   win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   win.webContents.on("will-navigate", (e, url) => {
     if (!allowedNavigation(url)) e.preventDefault();
@@ -521,6 +548,7 @@ app.whenReady().then(async () => {
           { role: "quit" },
         ],
       },
+      { role: "editMenu" },
     ]),
   );
   await createWindow();
@@ -531,6 +559,12 @@ app.whenReady().then(async () => {
 
 let finishingQuit = false;
 app.on("before-quit", (event) => {
+  if (process.platform === "darwin") {
+    // Native capture needs no routing restoration. Cancel pending discovery or
+    // capture immediately; never defer macOS quit behind the audio queue.
+    macAudio?.dispose();
+    return;
+  }
   if (process.platform !== "linux" || finishingQuit) return;
   event.preventDefault();
   finishingQuit = true;
@@ -538,5 +572,5 @@ app.on("before-quit", (event) => {
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
+  app.quit();
 });

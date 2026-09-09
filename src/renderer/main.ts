@@ -1,5 +1,6 @@
 import { LiveBuffer } from "./live-buffer";
 import { normalizeAudioSelection, includesAudioApp, audioSelectionLabel, type AudioSelection } from "../shared/audio-selection.mjs";
+import { startMacAudio, stopMacAudio } from "./macos-audio";
 import compatAudioUrl from "./compat-audio.worklet.js?url&no-inline";
 import {
   Room,
@@ -25,6 +26,8 @@ declare global {
       isElectron: true;
       platform?: string;
       audioSelectionVersion?: number;
+      beginMacAudio?: (selection: AudioSelection) => Promise<{ ok: boolean; id: number; label: string }>;
+      onMacAudio?: (callback: (packet: { id: number; bytes?: Uint8Array; error?: string }) => void) => () => void;
       setCaptureAudio?: (on: boolean) => Promise<void>;
       getSources: () => Promise<Source[]>;
       setCapture: (id: string, audio: boolean) => Promise<void>;
@@ -2087,8 +2090,10 @@ async function getStream(opts: {
   if (wantsAudio && windowsLoopback) {
     lastAudioLabel = stream.getAudioTracks().length ? "Entire system" : "";
     if (!stream.getAudioTracks().length) console.warn("[ezscreenshare] Windows loopback returned no audio track");
-  } else if (wantsAudio && isElectron) await addSystemAudio(stream);
-  else if (opts.audio) {
+  } else if (wantsAudio && isElectron) {
+    try { await addSystemAudio(stream); }
+    catch (error) { stream.getTracks().forEach(track => track.stop()); throw error; }
+  } else if (opts.audio) {
     const a = stream.getAudioTracks()[0];
     if (a) a.contentHint = "music";
     lastAudioLabel = a?.label || (a ? "tab audio" : "");
@@ -2114,6 +2119,7 @@ function readAudioSelection(): AudioSelection {
 }
 
 async function addSystemAudio(stream: MediaStream): Promise<void> {
+  stopMacAudio();
   lastAudioLabel = "";
   for (const t of stream.getAudioTracks()) {
     stream.removeTrack(t);
@@ -2127,6 +2133,13 @@ async function addSystemAudio(stream: MediaStream): Promise<void> {
   const wanted = readAudioSelection();
   if (wanted.mode === "include" && !wanted.apps.length) {
     await window.ez?.releaseAudioTap();
+    return;
+  }
+  if (desktopPlatform() === "darwin") {
+    lastAudioLabel = await startMacAudio(stream, wanted, error => {
+      const status = document.querySelector("#audioState");
+      if (status) status.textContent = error;
+    });
     return;
   }
   if (desktopPlatform() === "win32") {
@@ -2377,14 +2390,17 @@ function renderHost(): void {
   function drawAudioPickers(): void {
     const selection = readAudioSelection();
     const apps = audioSourceOptions.filter(source => source.id.startsWith("app:"));
+    for (const app of selection.apps) {
+      if (!apps.some(source => source.id === `app:${app}`)) apps.push({ id: `app:${app}`, label: `${app} (not running)` });
+    }
     for (const id of ["audioSrc", "audioSrcLive"]) {
       const root = qs<HTMLElement>(`#${id}`);
       root.querySelector("summary")!.textContent = audioSelectionLabel({
-        ...selection, apps: selection.apps.filter(name => apps.some(source => source.id === `app:${name}`)),
+        ...selection, apps: selection.apps.map(name => apps.find(source => source.id === `app:${name}`)?.label || name),
       });
       const list = root.querySelector(".audio-options")!;
       list.replaceChildren();
-      for (const source of [{ id: "system", label: desktopPlatform() === "linux" ? "Entire system (uncheck apps to exclude)" : "Entire system" }, ...apps]) {
+      for (const source of [{ id: "system", label: desktopPlatform() !== "win32" ? "Entire system (uncheck apps to exclude)" : "Entire system" }, ...apps]) {
         const label = document.createElement("label");
         label.className = "check";
         const input = document.createElement("input");
@@ -2402,16 +2418,6 @@ function renderHost(): void {
     const sources = (await window.ez?.listAudioSources?.()) ?? [];
     if (generation !== audioRefreshGeneration) return;
     audioSourceOptions = sources;
-    const selection = readAudioSelection();
-    const apps = selection.apps.filter(name => sources.some(source => source.id === `app:${name}`));
-    // Forget vanished selected apps. Retain exclusions internally so a
-    // restarted voice client cannot unexpectedly enter an "all except" mix.
-    if (selection.mode === "include" && apps.length !== selection.apps.length) {
-      localStorage.setItem("ezscreenshare.audioSelection", JSON.stringify({ ...selection, apps }));
-      audioChange = audioChange.then(reattachAudio).catch(error => {
-        err.textContent = error instanceof Error ? error.message : String(error);
-      });
-    }
     drawAudioPickers();
   }
   let audioChange = Promise.resolve();
@@ -2449,12 +2455,12 @@ function renderHost(): void {
     document.querySelector("#audioSrcLiveWrap")?.classList.toggle("hidden", !on);
   }
 
-  if (isElectron) void fillAudioSelects();
+  if (isElectron) void fillAudioSelects().catch(error => { err.textContent = String(error.message || error); });
   qs("#audio").addEventListener("change", syncAudioRow);
   for (const id of ["audioSrc", "audioSrcLive"]) {
     const picker = qs<HTMLDetailsElement>(`#${id}`);
     picker.addEventListener("change", changeAudioSelection);
-    picker.addEventListener("toggle", () => { if (picker.open) void fillAudioSelects(); });
+    picker.addEventListener("toggle", () => { if (picker.open) void fillAudioSelects().catch(error => { err.textContent = String(error.message || error); }); });
   }
 
   function people(): void {
@@ -2549,6 +2555,14 @@ function renderHost(): void {
         });
       }
     }
+    if (!audio) {
+      stopMacAudio();
+      await window.ez?.releaseAudioTap();
+      if (audioPub?.track) {
+        await room.localParticipant.unpublishTrack(audioPub.track);
+        audioPub = null;
+      }
+    }
     video?.addEventListener("ended", () => void stop());
     const audioOn = (localStream?.getAudioTracks().length ?? 0) > 0;
     const audioState = document.querySelector<HTMLElement>("#audioState");
@@ -2572,6 +2586,7 @@ function renderHost(): void {
     const showViewers = showViewersSetup.checked;
     localStorage.setItem(showViewersKey, showViewers ? "1" : "0");
     showViewersLive.checked = showViewers;
+    let captured: MediaStream | undefined;
     try {
       const created = await api<CreateResp>("/api/rooms", {
         hostPassword: hostKeyInput.value,
@@ -2586,6 +2601,7 @@ function renderHost(): void {
         height,
         fps,
       });
+      captured = stream;
       room = new Room(roomOpts("host"));
       room.on(RoomEvent.ParticipantConnected, people);
       room.on(RoomEvent.ParticipantDisconnected, people);
@@ -2630,7 +2646,8 @@ function renderHost(): void {
       history.replaceState(null, "", `/r/${created.roomId}`);
     } catch (e) {
       err.textContent = e instanceof Error ? e.message : String(e);
-      localStream?.getTracks().forEach((t) => t.stop());
+      captured?.getTracks().forEach((t) => t.stop());
+      await stop();
     }
   }
 
@@ -2643,6 +2660,7 @@ function renderHost(): void {
     ingest?.stop();
     ingest = null;
     fallbackWatchers = [];
+    stopMacAudio();
     void window.ez?.releaseAudioTap?.();
     localStream?.getTracks().forEach((t) => t.stop());
     localStream = null;
@@ -2744,8 +2762,16 @@ function renderHost(): void {
       localStream.removeTrack(t);
       t.stop();
     }
+    const currentStream = localStream;
+    const currentRoom = room;
     const tmp = new MediaStream(localStream.getVideoTracks());
     await addSystemAudio(tmp);
+    if (localStream !== currentStream || room !== currentRoom) {
+      tmp.getAudioTracks().forEach(track => track.stop());
+      stopMacAudio();
+      await window.ez?.releaseAudioTap();
+      return;
+    }
     const audio = tmp.getAudioTracks()[0];
     if (audio) {
       localStream.addTrack(audio);

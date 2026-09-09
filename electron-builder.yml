@@ -27,3 +27,9 @@ win:
 mac:
   target: dmg
   category: public.app-category.video
+  extendInfo:
+    NSAudioCaptureUsageDescription: Share audio from the applications you select.
+    NSScreenCaptureUsageDescription: Share the screen or window you select.
+  extraResources:
+    - from: dist/native/macos-audio
+      to: native/macos-audio

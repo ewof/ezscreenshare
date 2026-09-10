@@ -120,6 +120,13 @@ input:focus, select:focus { border-color: var(--focus); }
   margin-top: 4px;
 }
 #sourceWrap .sub { flex-shrink: 0; }
+.source-heading { margin: 0 0 6px; font-size: 15px; font-weight: 400; color: var(--text); }
+.desktop-filter-wrap { width: 100%; min-width: 0; margin-top: 10px; }
+.desktop-tabs { display: flex; flex-wrap: nowrap; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+.desktop-tab { flex: 0 0 auto; padding: 8px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); }
+.desktop-tab[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--btn-text); }
+.desktop-tab:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.source-placeholder { display: grid; place-items: center; height: 90px; padding: 12px; background: var(--stage); color: var(--muted); font-size: 13px; }
 .sources {
   display: grid;
   grid-template-columns: repeat(auto-fill, 168px);

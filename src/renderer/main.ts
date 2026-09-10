@@ -32,6 +32,7 @@ declare global {
       onMacAudio?: (callback: (packet: { id: number; bytes?: Uint8Array; error?: string }) => void) => () => void;
       setCaptureAudio?: (on: boolean) => Promise<void>;
       getSources: () => Promise<Source[]>;
+      getSourceCatalog?: () => Promise<{ sources: Source[]; desktops: VirtualDesktop[] }>;
       setCapture: (id: string, audio: boolean) => Promise<void>;
       monitorHint: () => Promise<string>;
       copyText: (text: string) => Promise<void>;
@@ -47,7 +48,8 @@ declare global {
   }
 }
 
-type Source = { id: string; name: string; thumbnail: string; kind: "screen" | "window" };
+type Source = { id: string; name: string; thumbnail: string; kind: "screen" | "window"; desktopId?: string; onCurrentDesktop?: boolean };
+type VirtualDesktop = { id: string; name: string; current: boolean };
 
 type CreateResp = {
   roomId: string;
@@ -2269,13 +2271,17 @@ function renderHost(): void {
           <label class="check"><input id="tcp" type="checkbox" checked /> force TCP</label>
           <label class="check"><input id="showViewers" type="checkbox" checked /> viewers see who's watching</label>
         </div>
+        <div class="desktop-filter-wrap hidden" id="desktopFilters">
+          <div class="source-heading">desktops</div>
+          <div class="desktop-tabs" role="group" aria-label="Show video sources from desktops"></div>
+        </div>
         <div class="row ${isElectron ? "" : "hidden"}" id="audioSrcRow">
           <div class="field">audio sources
             <details class="audio-picker" id="audioSrc"><summary>Entire system</summary><div class="audio-menu"><input class="audio-search" type="search" placeholder="Search audio sources…" aria-label="Search audio sources" /><div class="audio-options"></div><p class="audio-empty hidden" role="status">No matching sources</p></div></details>
           </div>
         </div>
         <div id="sourceWrap" class="${isElectron ? "" : "hidden"}">
-          <p class="sub">source</p>
+          <p class="source-heading">video sources</p>
           <div id="sources" class="sources"></div>
         </div>
         <div class="row">
@@ -2307,7 +2313,7 @@ function renderHost(): void {
         </div>
         <div class="err" id="liveErr" role="status"></div>
         <div id="liveSources" class="live-sources hidden">
-          <p class="sub">pick a source</p>
+          <p class="source-heading">video sources</p>
           <div id="liveSourceGrid" class="sources"></div>
         </div>
         <div class="row">
@@ -2320,6 +2326,10 @@ function renderHost(): void {
             </select>
           </label>
           ${fpsSelectHtml("fpsLive")}
+          <div class="desktop-filter-wrap hidden" id="desktopFiltersLive">
+            <div class="source-heading">desktops</div>
+            <div class="desktop-tabs" role="group" aria-label="Show video sources from desktops"></div>
+          </div>
           <div class="field ${isElectron ? "" : "hidden"}" id="audioSrcLiveWrap">audio sources
             <details class="audio-picker" id="audioSrcLive"><summary>Entire system</summary><div class="audio-menu"><input class="audio-search" type="search" placeholder="Search audio sources…" aria-label="Search audio sources" /><div class="audio-options"></div><p class="audio-empty hidden" role="status">No matching sources</p></div></details>
           </div>
@@ -2377,12 +2387,55 @@ function renderHost(): void {
   const pingById = new Map<string, number>();
   let stopPing: (() => void) | null = null;
   let stopStats: (() => void) | null = null;
+  let virtualDesktops: VirtualDesktop[] = [];
+  const excludedDesktops = new Set<string>();
+  function applyDesktopFilter(): void {
+    for (const card of document.querySelectorAll<HTMLElement>(".source")) {
+      card.classList.toggle("hidden", Boolean(card.dataset.desktopId && excludedDesktops.has(card.dataset.desktopId)));
+    }
+    // Filtering changes the list, never the live capture. Before a stream,
+    // require a visible source so a hidden selection cannot be shared by mistake.
+    if (!room && selected?.desktopId && excludedDesktops.has(selected.desktopId)) {
+      selected = null;
+      qs("#sources").querySelectorAll(".selected").forEach(card => card.classList.remove("selected"));
+    }
+  }
+  function drawDesktopFilters(): void {
+    for (const id of ["desktopFilters", "desktopFiltersLive"]) {
+      const root = qs(`#${id}`);
+      root.classList.toggle("hidden", virtualDesktops.length === 0);
+      const tabs = root.querySelector(".desktop-tabs")!;
+      tabs.replaceChildren();
+      for (const desktop of virtualDesktops) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "desktop-tab";
+        button.dataset.desktopId = desktop.id;
+        button.textContent = desktop.name;
+        button.setAttribute("aria-pressed", String(!excludedDesktops.has(desktop.id)));
+        button.title = desktop.current ? `${desktop.name} (current)` : desktop.name;
+        button.addEventListener("click", () => {
+          if (excludedDesktops.has(desktop.id)) excludedDesktops.delete(desktop.id);
+          else excludedDesktops.add(desktop.id);
+          drawDesktopFilters();
+          applyDesktopFilter();
+          root.querySelector<HTMLButtonElement>(`[data-desktop-id="${desktop.id}"]`)?.focus();
+        });
+        tabs.append(button);
+      }
+    }
+  }
 
   async function loadSources(box: HTMLElement, onPick?: (s: Source) => void, errorTarget = err): Promise<void> {
     if (!window.ez) return;
     let sources: Source[] = [];
     try {
-      sources = await window.ez.getSources();
+      if (window.ez.getSourceCatalog) {
+        const catalog = await window.ez.getSourceCatalog();
+        sources = catalog.sources;
+        virtualDesktops = catalog.desktops;
+        drawDesktopFilters();
+      } else sources = await window.ez.getSources();
     } catch (e) {
       errorTarget.textContent = e instanceof Error ? e.message : String(e);
       return;
@@ -2392,13 +2445,23 @@ function renderHost(): void {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "source";
+      if (s.desktopId) btn.dataset.desktopId = s.desktopId;
+      const desktopName = virtualDesktops.find(desktop => desktop.id === s.desktopId)?.name;
+      btn.title = [s.name, desktopName, s.onCurrentDesktop === false ? "Switch to this desktop if the window is paused or unavailable." : ""].filter(Boolean).join(" · ");
       if (selected?.id === s.id) btn.classList.add("selected");
       const img = document.createElement("img");
       img.alt = "";
       img.src = s.thumbnail;
       const cap = document.createElement("figcaption");
-      cap.textContent = `${s.kind}: ${s.name}`;
-      btn.append(img, cap);
+      cap.textContent = s.kind === "screen" && desktopPlatform() === "win32" ? `Full display: ${s.name}` : s.name;
+      if (s.thumbnail) btn.append(img);
+      else {
+        const placeholder = document.createElement("span");
+        placeholder.className = "source-placeholder";
+        placeholder.textContent = desktopName || "window";
+        btn.append(placeholder);
+      }
+      btn.append(cap);
       btn.addEventListener("click", () => {
         selected = s;
         for (const el of box.querySelectorAll(".source")) el.classList.remove("selected");
@@ -2407,10 +2470,14 @@ function renderHost(): void {
       });
       box.appendChild(btn);
     }
-    if (sources[0] && !selected) {
-      selected = sources[0];
-      box.querySelector(".source")?.classList.add("selected");
+    if (!selected && !onPick) {
+      const first = sources.find(source => !source.desktopId || !excludedDesktops.has(source.desktopId));
+      if (first) {
+        selected = first;
+        [...box.querySelectorAll(".source")][sources.indexOf(first)]?.classList.add("selected");
+      }
     }
+    applyDesktopFilter();
   }
 
   qs("#refresh").addEventListener("click", () => {
@@ -2644,6 +2711,7 @@ function renderHost(): void {
   async function start(): Promise<void> {
     err.textContent = "";
     saveHostSettings();
+    if (isElectron && !selected) { err.textContent = "Choose a video source first."; return; }
     const height = Number(qs<HTMLSelectElement>("#res").value);
     const fps = Number(qs<HTMLSelectElement>("#fps").value);
     const audio = qs<HTMLInputElement>("#audio").checked;

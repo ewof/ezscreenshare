@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld("ez", {
     };
   },
   getSources: () => ipcRenderer.invoke("ez:getSources"),
+  getSourceCatalog: () => ipcRenderer.invoke("ez:getSourceCatalog"),
   setCaptureAudio: (on) => ipcRenderer.invoke("ez:setCaptureAudio", on),
   setCapture: (id, audio) => ipcRenderer.invoke("ez:setCapture", id, audio),
   monitorHint: () => ipcRenderer.invoke("ez:monitorHint"),

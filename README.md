@@ -57,6 +57,10 @@ The audio picker has a search field. Click anywhere on an application row to sel
 
 Host settings are remembered on this device for each server: nickname, host key, viewer password, resolution, FPS, audio sharing, force TCP, and viewer-list visibility. Changes are saved as you edit, including resolution/FPS changes during a stream. Clear the viewer password field to save streams without a viewer password again. Audio selections, theme, and stats visibility are also remembered.
 
+On Windows, the desktop buttons above audio sources filter the **video sources** list. All desktops start selected; selected buttons are blue. They only filter the picker, so toggling one does not move windows, change your Windows desktop, or change an active stream. Full-display sources remain available because they follow the active desktop. Windows on other desktops can be selected directly; a game may pause rendering while its desktop is inactive. Desktop names/order use Explorer's registry metadata when available, with window-to-desktop IDs as a fallback.
+
+Some fullscreen games trigger a Windows Graphics Capture bug that hides the host's local cursor while the stream still shows it. For these games, choose a **Full display** video source: Windows display capture uses DXGI/GDI instead of WGC. This shares the entire display, including anything else visible there. Ordinary window capture still uses WGC and can still exhibit that Windows bug. See [Microsoft's issue](https://github.com/microsoft/Windows.UI.Composition-Win32-Samples/issues/128).
+
 After an update, restart the desktop host and hard-refresh browser hosts and viewers. Already-open host pages continue running their old encoder until reloaded.
 
 **Website in Chromium/Brave**  

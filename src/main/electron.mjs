@@ -1,4 +1,5 @@
 import { MacAudio } from "./macos-audio.mjs";
+import { readWindowsDesktops, mergeDesktopSources } from "./windows-desktops.mjs";
 import { normalizeAudioSelection, includesAudioApp, audioSelectionLabel } from "../shared/audio-selection.mjs";
 import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, Menu, session } from "electron";
 import { execFile } from "node:child_process";
@@ -47,6 +48,12 @@ function serverUrl() {
 
 app.commandLine.appendSwitch("ozone-platform-hint", "auto");
 app.commandLine.appendSwitch("enable-features", "WebRTCPipeWireCapturer,LoopbackWaveIn");
+if (process.platform === "win32") {
+  // WGC can suppress a fullscreen game's LOCAL hardware cursor. Keep full
+  // display capture on DXGI/GDI so it provides an explicit game workaround.
+  // Window capture remains WGC; never silently expand a window to a display.
+  app.commandLine.appendSwitch("disable-features", "AllowWgcScreenCapturer");
+}
 
 let macAudio;
 let windowsAudio;
@@ -68,11 +75,24 @@ function armMedia() {
   mediaArmedUntil = Date.now() + 180_000;
 }
 
+async function getSourceCatalog(thumbnailSize = { width: 160, height: 90 }) {
+  const sources = await desktopCapturer.getSources({ types: ["screen", "window"], thumbnailSize, fetchWindowIcons: false });
+  let desktops = { sources: [], desktops: [] };
+  if (process.platform === "win32") {
+    try {
+      desktops = await readWindowsDesktops(app.isPackaged
+        ? join(process.resourcesPath, "native/windows-desktops.exe")
+        : join(here, "../../dist/native/windows-desktops.exe"));
+    } catch (error) { console.warn("[ezs] virtual desktops unavailable", error.message); }
+  }
+  return mergeDesktopSources(sources, desktops);
+}
+
 function registerCapture() {
   session.defaultSession.setDisplayMediaRequestHandler(async (_req, callback) => {
     let sources;
     try {
-      sources = await desktopCapturer.getSources({ types: ["screen", "window"], thumbnailSize: { width: 1, height: 1 } });
+      ({ sources } = await getSourceCatalog({ width: 1, height: 1 }));
     } catch (error) {
       console.error("[ezs] capture", error);
       callback({});
@@ -93,25 +113,13 @@ function registerCapture() {
   });
 }
 
+ipcMain.handle("ez:getSourceCatalog", async () => {
+  armMedia();
+  return getSourceCatalog();
+});
 ipcMain.handle("ez:getSources", async () => {
   armMedia();
-  try {
-    const sources = await desktopCapturer.getSources({
-      types: ["screen", "window"],
-      thumbnailSize: { width: 160, height: 90 },
-      fetchWindowIcons: false,
-    });
-    console.log(`[ezs] sources ${sources.length}`);
-    return sources.map((s) => ({
-      id: s.id,
-      name: s.name,
-      kind: s.id.startsWith("screen:") ? "screen" : "window",
-      thumbnail: s.thumbnail.toDataURL(),
-    }));
-  } catch (e) {
-    console.error("[ezs] getSources", e);
-    throw e;
-  }
+  return (await getSourceCatalog()).sources;
 });
 
 ipcMain.handle("ez:setCapture", (_e, id, audio) => {

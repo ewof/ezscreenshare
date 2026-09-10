@@ -13,6 +13,14 @@ if (process.platform === 'darwin') {
   compiler = 'xcrun';
   args = ['swiftc', '-parse-as-library', '-O', source, '-o', binary];
 } else if (process.platform === 'win32') {
+  const desktopSource = join(root, 'src/native/windows-desktops.cs');
+  const desktopBinary = join(output, 'windows-desktops.exe');
+  const csc = join(process.env.SystemRoot || 'C:/Windows', 'Microsoft.NET/Framework64/v4.0.30319/csc.exe');
+  if (!existsSync(desktopBinary) || statSync(desktopBinary).mtimeMs < Math.max(statSync(desktopSource).mtimeMs, statSync(fileURLToPath(import.meta.url)).mtimeMs)) {
+    const build = spawnSync(csc, ['/nologo', '/optimize+', '/platform:x64', '/reference:System.Web.Extensions.dll', `/out:${desktopBinary}`, desktopSource], { stdio: 'inherit' });
+    if (build.error) throw build.error;
+    if (build.status !== 0) process.exit(build.status ?? 1);
+  }
   source = join(root, 'src/native/windows-audio.cs');
   binary = join(output, 'windows-audio.exe');
   compiler = join(process.env.SystemRoot || 'C:/Windows', 'Microsoft.NET/Framework64/v4.0.30319/csc.exe');

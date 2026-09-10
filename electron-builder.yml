@@ -27,6 +27,8 @@ win:
   extraResources:
     - from: dist/native/windows-audio.exe
       to: native/windows-audio.exe
+    - from: dist/native/windows-desktops.exe
+      to: native/windows-desktops.exe
 mac:
   target: dmg
   category: public.app-category.video

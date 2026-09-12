@@ -218,7 +218,6 @@ async function pinHearSink(hearSink) {
   if (!dest || dest === TAP) return dest;
   const def = (await pactl(["get-default-sink"])).trim();
   if (!def || def === TAP || def.includes(TAP)) await pactl(["set-default-sink", dest]);
-  await pactl(["set-sink-mute", dest, "0"]);
   return dest;
 }
 
@@ -440,6 +439,19 @@ ipcMain.handle("ez:beginMonitorCapture", (_e, selection) => serializeAudio(async
   if (!sink || (wanted.mode === "include" && !wanted.apps.length)) {
     await teardownTap();
     return { ok: false, prev: "", label: "" };
+  }
+  // System capture only needs a recording source. Moving every playing app
+  // through a new loopback interrupts the local output during stream startup.
+  if (wanted.mode === "exclude" && !wanted.apps.length) {
+    if (tap.sinkMod || tap.loopMod || tap.moved.length || tap.remapMaster === `${TAP}.monitor`) {
+      await teardownTap();
+    }
+    tapSelection = null;
+    await ensureVirt(`${sink}.monitor`);
+    return {
+      ok: Boolean(tap.remapMod), prev: "", label: audioSelectionLabel(wanted),
+      hints: ["ezscreenshare", "Monitor of ezscreenshare"],
+    };
   }
   await ensureTap(sink);
   await ensureVirt(`${TAP}.monitor`);

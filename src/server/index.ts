@@ -63,6 +63,9 @@ function sendMedia(rec: RoomRecord, data: Buffer): void {
 type RoomRecord = {
   id: string;
   passwordHash: Buffer | null;
+  previews: boolean;
+  preview: Buffer | null;
+  previewAt: number;
   forceTcp: boolean;
   createdAt: number;
   ingestToken: string;
@@ -403,6 +406,30 @@ const MIME: Record<string, string> = {
   ".map": "application/json",
 };
 
+function previewAvailable(rec: RoomRecord | undefined): rec is RoomRecord {
+  return Boolean(rec && rec.previews && !rec.passwordHash && rec.ingest &&
+    rec.preview && Date.now() - rec.previewAt < 120_000);
+}
+
+function previewMetadata(reqPath: string): string {
+  const id = reqPath.match(/^\/r\/([A-Za-z0-9_-]+)\/?$/)?.[1];
+  const rec = id ? rooms.get(id) : undefined;
+  if (!previewAvailable(rec)) return "";
+  const escape = (value: string) => value.replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+  const page = escape(`${PUBLIC_URL}/r/${rec.id}`);
+  const image = escape(`${PUBLIC_URL}/api/rooms/${rec.id}/preview?v=${rec.previewAt}`);
+  return `<meta property="og:site_name" content="ezscreenshare">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Live screen share">
+<meta property="og:description" content="Watch this live stream on ezscreenshare.">
+<meta property="og:url" content="${page}">
+<meta property="og:image" content="${image}">
+<meta property="og:image:type" content="image/jpeg">
+<meta property="og:image:alt" content="Latest stream screenshot">
+<meta name="twitter:card" content="summary_large_image">`;
+}
+
 function serveStatic(reqPath: string, res: ServerResponse): boolean {
   if (!existsSync(WEB_DIR)) return false;
   const raw = reqPath === "/" || reqPath.startsWith("/r/") ? "/index.html" : reqPath;
@@ -426,7 +453,7 @@ function serveStatic(reqPath: string, res: ServerResponse): boolean {
   // This does not replace code in an already-open host tab: reload that tab.
   if (html) res.setHeader("cache-control", "no-store");
   res.writeHead(200, { "content-type": MIME[extname(file)] ?? "application/octet-stream" });
-  res.end(readFileSync(file));
+  res.end(html ? readFileSync(file, "utf8").replace("</head>", `${previewMetadata(reqPath)}</head>`) : readFileSync(file));
   return true;
 }
 
@@ -467,6 +494,7 @@ const server = createServer(async (req, res) => {
         return;
       }
       const body = JSON.parse((await readBody(req)) || "{}") as {
+        previews?: boolean;
         password?: string;
         hostPassword?: string;
         forceTcp?: boolean;
@@ -490,6 +518,9 @@ const server = createServer(async (req, res) => {
       rooms.set(id, {
         id,
         passwordHash: password ? hashPassword(password) : null,
+        previews: body.previews === true && !password,
+        preview: null,
+        previewAt: 0,
         forceTcp,
         createdAt: Date.now(),
         ingestToken,
@@ -537,6 +568,54 @@ const server = createServer(async (req, res) => {
         },
         req,
       );
+      return;
+    }
+
+    const previewMatch = url.pathname.match(/^\/api\/rooms\/([A-Za-z0-9_-]+)\/preview$/);
+    if (previewMatch) {
+      const rec = rooms.get(previewMatch[1]);
+      if (req.method === "POST") {
+        if (!rec || !tokenEq(bearerToken(req), rec.ingestToken)) {
+          json(res, 403, { error: "bad token" }, req);
+          return;
+        }
+        if (req.headers["content-type"] === "application/json") {
+          const body = JSON.parse(await readBody(req));
+          rec.previews = body.enabled === true && !rec.passwordHash;
+          rec.preview = null;
+          json(res, 200, { enabled: rec.previews }, req);
+          return;
+        }
+        if (req.headers["content-type"] !== "image/jpeg") {
+          json(res, 415, { error: "expected JPEG" }, req);
+          return;
+        }
+        let data: Buffer;
+        try { data = await readBuffer(req, 300_000); }
+        catch { json(res, 413, { error: "preview too large" }, req); return; }
+        // Recheck after reading: disabling previews may race an upload.
+        if (!rec.previews || rec.passwordHash || !rec.ingest) {
+          json(res, 403, { error: "previews unavailable" }, req);
+          return;
+        }
+        if (data.length < 4 || data[0] !== 255 || data[1] !== 216 ||
+            data[data.length - 2] !== 255 || data[data.length - 1] !== 217) {
+          json(res, 400, { error: "invalid JPEG" }, req);
+          return;
+        }
+        rec.preview = data;
+        rec.previewAt = Date.now();
+        json(res, 200, { ok: true }, req);
+        return;
+      }
+      if ((req.method === "GET" || req.method === "HEAD") && previewAvailable(rec)) {
+        applySecHeaders(res);
+        res.writeHead(200, { "content-type": "image/jpeg", "cache-control": "no-store",
+          "content-length": rec.preview!.length });
+        res.end(req.method === "HEAD" ? undefined : rec.preview);
+        return;
+      }
+      json(res, 404, { error: "preview unavailable" }, req);
       return;
     }
 
@@ -717,7 +796,10 @@ server.on("upgrade", (req, socket, head) => {
         sendMedia(rec, data);
       },
       onClose() {
-        if (rec.ingest === ingestWs) rec.ingest = null;
+        if (rec.ingest === ingestWs) {
+          rec.ingest = null;
+          rec.preview = null;
+        }
         for (const w of rec.watchers) w.ws.send(JSON.stringify({ t: "gone" }));
         if (!rec.ingest && rec.watchers.size === 0) rec.gcAt = Date.now() + 90_000;
       },

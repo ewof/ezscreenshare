@@ -10,6 +10,7 @@ export type IceInfo = {
 };
 
 export type CreateRoomRequest = {
+  previews?: boolean;
   password: string;
   hostPassword: string;
   forceTcp: boolean;

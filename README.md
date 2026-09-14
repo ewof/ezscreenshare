@@ -134,3 +134,21 @@ Compatibility playback uses a bounded jitter buffer and reports stalls to the ho
 | `deploy/` | nginx snippets for the public name |
 
 FOSS. No telemetry. No remote control.
+
+### Link previews
+
+Hosts can enable **public link previews** before starting a stream or change the
+setting while live. The preference is remembered, and defaults to enabled.
+A viewer password always disables previews, regardless of this setting.
+The host uploads a JPEG screenshot (up to 960 × 540) when streaming starts and
+then every minute. Stream pages include Open Graph image metadata, following the
+[same embedding approach as phixiv](https://github.com/thelaao/phixiv/blob/main/templates/artwork.html).
+
+Disabling previews or disconnecting the host removes the server's screenshot.
+Screenshots older than two minutes are no longer served. Images are kept only in
+server memory. Discord and other services may cache screenshots already fetched:
+the minute interval updates the image on this server, but cannot force an existing
+Discord message to refresh or delete its cached image.
+
+Run `pnpm build && pnpm test` to exercise preview metadata, uploads, host controls,
+password protection, and disconnect cleanup against an isolated local server.

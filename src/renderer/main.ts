@@ -2270,6 +2270,7 @@ function renderHost(): void {
           <label class="check ${isElectron ? "" : "hidden"}"><input id="audio" type="checkbox" checked /> share audio</label>
           <label class="check"><input id="tcp" type="checkbox" checked /> force TCP</label>
           <label class="check"><input id="showViewers" type="checkbox" checked /> viewers see who's watching</label>
+          <label class="check"><input id="linkPreviews" type="checkbox" /> embeds have thumbnail preview (only passwordless streams; updated every minute)</label>
         </div>
         <div class="desktop-filter-wrap hidden" id="desktopFilters">
           <div class="source-heading">desktops</div>
@@ -2305,6 +2306,7 @@ function renderHost(): void {
           </div>
           <div class="hud-actions">
             <label class="check"><input id="showViewersLive" type="checkbox" checked /> viewers see who's watching</label>
+            <label class="check"><input id="linkPreviewsLive" type="checkbox" /> embeds have thumbnail preview (only passwordless streams; updated every minute)</label>
             <button class="btn secondary" id="statsToggle" type="button">stats</button>
             <button class="btn secondary" id="switch" type="button">change source</button>
             <button class="btn secondary ${isElectron ? "" : "hidden"}" id="refreshLive" type="button">refresh sources</button>
@@ -2354,6 +2356,13 @@ function renderHost(): void {
   const resolutionInput = qs<HTMLSelectElement>("#res");
   const fpsInput = qs<HTMLSelectElement>("#fps");
   const viewerPasswordInput = qs<HTMLInputElement>("#password");
+  const linkPreviews = qs<HTMLInputElement>("#linkPreviews");
+  const linkPreviewsLive = qs<HTMLInputElement>("#linkPreviewsLive");
+  linkPreviews.checked = localStorage.getItem("ezscreenshare.linkPreviews") !== "0";
+  function syncPreviewPassword(): void {
+    linkPreviews.disabled = Boolean(viewerPasswordInput.value.trim());
+  }
+  viewerPasswordInput.addEventListener("input", syncPreviewPassword);
   const audioInput = qs<HTMLInputElement>("#audio");
   const tcpInput = qs<HTMLInputElement>("#tcp");
   for (const [input, key] of [[resolutionInput, "resolution"], [fpsInput, "fps"]] as const) {
@@ -2361,9 +2370,11 @@ function renderHost(): void {
     if (saved && [...input.options].some(option => option.value === saved)) input.value = saved;
   }
   viewerPasswordInput.value = localStorage.getItem("ezscreenshare.viewerPassword") || "";
+  syncPreviewPassword();
   audioInput.checked = localStorage.getItem("ezscreenshare.shareAudio") !== "0";
   tcpInput.checked = localStorage.getItem("ezscreenshare.forceTcp") !== "0";
   function saveHostSettings(): void {
+    localStorage.setItem("ezscreenshare.linkPreviews", linkPreviews.checked ? "1" : "0");
     localStorage.setItem(nickKey, nick.value.trim() || "host");
     localStorage.setItem(hostKey, hostKeyInput.value);
     localStorage.setItem("ezscreenshare.resolution", resolutionInput.value);
@@ -2383,6 +2394,49 @@ function renderHost(): void {
   let videoPub: LocalTrackPublication | null = null;
   let audioPub: LocalTrackPublication | null = null;
   let ingest: ReturnType<typeof startIngest> | null = null;
+  let previewSession: CreateResp | null = null;
+  let previewTimer: number | undefined;
+  let previewBusy = false;
+  async function uploadPreview(): Promise<boolean> {
+    const session = previewSession;
+    if (!session || !linkPreviewsLive.checked || linkPreviewsLive.disabled || previewBusy) return false;
+    const video = qs<HTMLVideoElement>("#preview");
+    if (video.readyState < 2 || !video.videoWidth || !localStream?.getVideoTracks().some(t => t.readyState === "live")) return false;
+    previewBusy = true;
+    try {
+      const canvas = document.createElement("canvas");
+      const scale = Math.min(1, 960 / video.videoWidth, 540 / video.videoHeight);
+      canvas.width = Math.round(video.videoWidth * scale);
+      canvas.height = Math.round(video.videoHeight * scale);
+      canvas.getContext("2d")!.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, "image/jpeg", 0.75));
+      if (!blob || previewSession !== session || !linkPreviewsLive.checked) return false;
+      const response = await fetch(`/api/rooms/${session.roomId}/preview`, {
+        method: "POST", headers: { authorization: `Bearer ${session.ingestToken}`, "content-type": "image/jpeg" }, body: blob,
+      });
+      if (!response.ok) throw new Error("Preview upload failed");
+      return true;
+    } catch (error) { console.warn("Link preview", error); return false; }
+    finally { previewBusy = false; }
+  }
+  linkPreviewsLive.addEventListener("change", async () => {
+    const session = previewSession;
+    if (!session) return;
+    linkPreviewsLive.disabled = true;
+    try {
+      const response = await fetch(`/api/rooms/${session.roomId}/preview`, {
+        method: "POST", headers: { authorization: `Bearer ${session.ingestToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ enabled: linkPreviewsLive.checked }),
+      });
+      if (!response.ok) throw new Error("Could not change link previews. Please retry.");
+      linkPreviews.checked = linkPreviewsLive.checked;
+      saveHostSettings();
+    } catch (error) {
+      linkPreviewsLive.checked = !linkPreviewsLive.checked;
+      liveErr.textContent = String(error);
+    } finally { linkPreviewsLive.disabled = false; }
+    void uploadPreview();
+  });
   let fallbackWatchers: CompatWatcher[] = [];
   const pingById = new Map<string, number>();
   let stopPing: (() => void) | null = null;
@@ -2725,6 +2779,7 @@ function renderHost(): void {
         hostPassword: hostKeyInput.value,
         password: qs<HTMLInputElement>("#password").value,
         forceTcp,
+        previews: linkPreviews.checked && !linkPreviews.disabled,
         showViewers,
         nickname: nick.value.trim() || "host",
       });
@@ -2759,6 +2814,18 @@ function renderHost(): void {
         { fps, bitrate: ingestBitrate(height, fps) },
       );
       ingest.setViewersVisible(showViewers);
+      previewSession = created;
+      linkPreviewsLive.disabled = Boolean(viewerPasswordInput.value.trim());
+      linkPreviewsLive.checked = linkPreviews.checked && !linkPreviewsLive.disabled;
+      // Retry initial capture until video and ingest are ready, then update once a minute.
+      let nextPreview = 0;
+      previewTimer = window.setInterval(() => {
+        if (Date.now() < nextPreview || !qs<HTMLVideoElement>("#preview").videoWidth) return;
+        nextPreview = Date.now() + 5000;
+        void uploadPreview().then(uploaded => {
+          if (uploaded) nextPreview = Date.now() + 60_000;
+        });
+      }, 1000);
       stopStats?.();
       stopStats = bindStatsToggle(qs("#statsToggle"), qs("#stats"), async () => {
         const track = videoPub?.videoTrack ?? (videoPub?.track as LocalVideoTrack | undefined);
@@ -2785,6 +2852,9 @@ function renderHost(): void {
   }
 
   async function stop(): Promise<void> {
+    previewSession = null;
+    window.clearInterval(previewTimer);
+    previewTimer = undefined;
     stopPing?.();
     stopPing = null;
     stopStats?.();

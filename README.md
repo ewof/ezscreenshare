@@ -137,9 +137,13 @@ FOSS. No telemetry. No remote control.
 
 ### Link previews
 
-Hosts can enable **public link previews** before starting a stream or change the
+Every stream link has an Open Graph embed showing whether the stream is live or
+ended. Live password-protected streams say they have a password, without a thumbnail.
+Unknown or expired stream links show "Stream ended".
+
+Hosts can enable **embeds have thumbnail preview** before starting a stream or change the
 setting while live. The preference is remembered, and defaults to enabled.
-A viewer password always disables previews, regardless of this setting.
+A viewer password always disables thumbnails, regardless of this setting.
 The host uploads a JPEG screenshot (up to 960 × 540) when streaming starts and
 then every minute. Stream pages include Open Graph image metadata, following the
 [same embedding approach as phixiv](https://github.com/thelaao/phixiv/blob/main/templates/artwork.html).

@@ -413,21 +413,28 @@ function previewAvailable(rec: RoomRecord | undefined): rec is RoomRecord {
 
 function previewMetadata(reqPath: string): string {
   const id = reqPath.match(/^\/r\/([A-Za-z0-9_-]+)\/?$/)?.[1];
-  const rec = id ? rooms.get(id) : undefined;
-  if (!previewAvailable(rec)) return "";
+  if (!id) return "";
+  const rec = rooms.get(id);
+  const live = Boolean(rec?.ingest);
+  const title = live ? "Stream is live" : "Stream ended";
+  const description = !live ? "This stream has ended." : rec?.passwordHash
+    ? "This stream is live and has a password. Open the link and enter the password to watch."
+    : "This stream is live. Open the link to watch on ezscreenshare.";
   const escape = (value: string) => value.replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
-  const page = escape(`${PUBLIC_URL}/r/${rec.id}`);
-  const image = escape(`${PUBLIC_URL}/api/rooms/${rec.id}/preview?v=${rec.previewAt}`);
-  return `<meta property="og:site_name" content="ezscreenshare">
-<meta property="og:type" content="website">
-<meta property="og:title" content="Live screen share">
-<meta property="og:description" content="Watch this live stream on ezscreenshare.">
-<meta property="og:url" content="${page}">
-<meta property="og:image" content="${image}">
+  const page = escape(`${PUBLIC_URL}/r/${id}`);
+  const imageTags = previewAvailable(rec)
+    ? `<meta property="og:image" content="${escape(`${PUBLIC_URL}/api/rooms/${id}/preview?v=${rec.previewAt}`)}">
 <meta property="og:image:type" content="image/jpeg">
 <meta property="og:image:alt" content="Latest stream screenshot">
-<meta name="twitter:card" content="summary_large_image">`;
+<meta name="twitter:card" content="summary_large_image">`
+    : '<meta name="twitter:card" content="summary">';
+  return `<meta property="og:site_name" content="ezscreenshare">
+<meta property="og:type" content="website">
+<meta property="og:title" content="${title}">
+<meta property="og:description" content="${description}">
+<meta property="og:url" content="${page}">
+${imageTags}`;
 }
 
 function serveStatic(reqPath: string, res: ServerResponse): boolean {

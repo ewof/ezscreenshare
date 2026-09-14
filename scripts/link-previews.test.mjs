@@ -8,7 +8,7 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 
 // Exercise the real HTTP and ingest routes with an isolated server and fake LiveKit API.
-test('public previews require host consent, no password, and a connected host', async () => {
+test('stream embeds show live, password, and ended states; thumbnails require consent', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ezs-previews-'));
   const fake = createServer((req, res) => { res.setHeader('content-type', 'application/json'); res.end('{}'); });
   fake.listen(0, '127.0.0.1');
@@ -56,6 +56,7 @@ test('public previews require host consent, no password, and a connected host', 
     const page = async r => (await fetch(`${base}/r/${r.roomId}`)).text();
     const publicRoom = await room({ previews: true });
     assert.equal((await fetch(publicRoom.url)).status, 404);
+    assert.match(await page(publicRoom), /property="og:title" content="Stream is live"/);
     assert.equal((await upload(publicRoom, 'wrong')).status, 403);
     assert.equal((await upload(publicRoom)).status, 200);
     assert.match(await page(publicRoom), /property="og:image"/);
@@ -75,16 +76,24 @@ test('public previews require host consent, no password, and a connected host', 
     await new Promise(resolve => publicRoom.ws.addEventListener('close', resolve));
     assert.equal((await fetch(publicRoom.url)).status, 404);
     assert.doesNotMatch(await page(publicRoom), /property="og:image"/);
+    assert.match(await page(publicRoom), /property="og:title" content="Stream ended"/);
     for (const options of [{ previews: false }, { previews: true, password: 'private' }]) {
       const r = await room(options);
       assert.equal((await upload(r)).status, 403);
       assert.doesNotMatch(await page(r), /property="og:image"/);
+      assert.match(await page(r), /property="og:title" content="Stream is live"/);
       if (options.password) {
+        assert.match(await page(r), /is live and has a password/);
         assert.equal((await (await toggle(r, true)).json()).enabled, false);
         assert.equal((await upload(r)).status, 403);
       }
     }
     assert.equal((await fetch(`${base}/api/rooms/missing/preview`)).status, 404);
+    const dead = await page({ roomId: 'missing' });
+    assert.match(dead, /property="og:title" content="Stream ended"/);
+    assert.match(dead, /This stream has ended/);
+    assert.doesNotMatch(dead, /property="og:image"/);
+    assert.doesNotMatch(await (await fetch(base)).text(), /property="og:title"/);
   } finally {
     for (const ws of sockets) ws.close();
     if (child) { child.kill(); await once(child, 'exit'); }

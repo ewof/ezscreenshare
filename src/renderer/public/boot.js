@@ -42,9 +42,6 @@ document.documentElement.dataset.theme =
       out.push(copy);
     }
     next.iceServers = out;
-    try {
-      console.info("[ezscreenshare] iceServers", JSON.stringify(next.iceServers));
-    } catch (e) {}
     return next;
   }
   var Orig = window.RTCPeerConnection;

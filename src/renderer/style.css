@@ -251,6 +251,8 @@ input:focus, select:focus { border-color: var(--focus); }
   text-overflow: ellipsis;
 }
 
+#proxyHelp { margin-top: 14px; }
+
 .people-panel {
   margin-top: 14px;
   min-height: 0;

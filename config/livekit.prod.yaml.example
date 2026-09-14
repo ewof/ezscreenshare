@@ -6,6 +6,10 @@ log_level: info
 bind_addresses:
   - 127.0.0.1
 rtc:
+  # Limit ICE to the interface that receives forwarded media. Replace eth0.
+  # Mapping Docker/VPN interfaces to the same node_ip can break UDP/TURN.
+  # interfaces:
+  #   includes: [eth0]
   tcp_port: 21115
   udp_port: 21116
   use_external_ip: false

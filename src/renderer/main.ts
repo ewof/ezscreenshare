@@ -295,8 +295,8 @@ function roomOpts(kind: "host" | "viewer") {
       noiseSuppression: false,
     },
     rtcConfig: {
-      // Firefox behind SOCKS disables ICE-TCP when policy is "relay", so TURNS
-      // never allocates. "all" still has no host candidates (default_address_only).
+      // Normal clients may use direct ICE. Proxy-only viewers must enforce
+      // relay/proxy restrictions in their browser profile.
       iceTransportPolicy: "all" as RTCIceTransportPolicy,
     },
   };
@@ -2980,11 +2980,22 @@ function renderViewer(roomId: string): void {
                 <option value="high">full</option>
               </select>
             </label>
-            <label class="hud-field">volume
+            <label id="compatVolume" class="hud-field hidden">volume
               <input id="vol" type="range" min="0" max="100" value="100" />
             </label>
             <button class="btn secondary" id="statsToggle" type="button">stats</button>
           </div>
+        </div>
+        <div id="proxyHelp" class="panel hidden" role="region" aria-labelledby="proxyHelpTitle">
+          <p id="proxyHelpTitle">Try lower-delay live playback</p>
+          <p>Using Tor or a proxy? Firefox may need microphone permission to establish a live connection, even though you are only watching.</p>
+          <p>If you continue, your browser briefly opens the microphone and we immediately stop it. No microphone audio is recorded or sent. Choose “Remember this decision” if Firefox offers it. This grants the site microphone access; you can revoke it in site settings.</p>
+          <p>If playback does not switch to live after allowing microphone access, reload this page and rejoin the stream.</p>
+          <div class="row">
+            <button id="proxyEnable" class="btn" type="button">allow microphone and retry live</button>
+            <button id="proxyDismiss" class="btn secondary" type="button">stay in compatibility mode</button>
+          </div>
+          <p id="proxyHelpResult" class="sub" role="status"></p>
         </div>
         <div class="panel people-panel">
           <div class="sub">connected</div>
@@ -3108,6 +3119,9 @@ function renderViewer(roomId: string): void {
     const el = qs("#status");
     el.textContent = text;
     el.classList.toggle("live", live);
+    qs("#compatVolume").classList.toggle("hidden", text !== "compatibility");
+    if (text === "live") qs("#proxyHelp").classList.add("hidden");
+    if (text === "compatibility") void maybeOfferProxyHelp();
   }
 
   function showWatch(): void {
@@ -3254,6 +3268,83 @@ function renderViewer(roomId: string): void {
     pcmPlayer.port.postMessage({ rate, samples }, [samples.buffer]);
   }
 
+  // Websites cannot read proxy settings. An empty host-only ICE probe is only
+  // a restriction heuristic; offer an explanation, never automatic capture.
+  let proxyHelpDismissed = false;
+  let proxyProbe: Promise<boolean> | null = null;
+  let viewerGeneration = 0;
+  async function restrictedFirefoxIce(): Promise<boolean> {
+    if (!/Firefox\//.test(navigator.userAgent) || !window.RTCPeerConnection ||
+        !navigator.mediaDevices?.getUserMedia) return false;
+    try {
+      const permission = await navigator.permissions.query({ name: "microphone" as PermissionName });
+      if (permission.state !== "prompt") return false;
+    } catch { /* Some Firefox versions do not expose microphone permission. */ }
+    let pc: RTCPeerConnection | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      pc = new RTCPeerConnection({ iceServers: [] });
+      let candidates = 0;
+      const finished = new Promise<boolean>((resolve) => {
+        pc!.addEventListener("icecandidate", (event) => {
+          if (event.candidate) candidates++;
+          else resolve(candidates === 0);
+        });
+        pc!.addEventListener("icegatheringstatechange", () => {
+          if (pc!.iceGatheringState === "complete") resolve(candidates === 0);
+        });
+        pc!.addEventListener("iceconnectionstatechange", () => {
+          if (pc!.iceConnectionState === "failed") resolve(candidates === 0);
+        });
+        // Timeout is inconclusive, not evidence that a proxy is configured.
+        timer = setTimeout(() => resolve(false), 5000);
+      });
+      pc.createDataChannel("connection-check");
+      await pc.setLocalDescription(await pc.createOffer());
+      return await finished;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timer);
+      pc?.close();
+    }
+  }
+  async function maybeOfferProxyHelp(): Promise<void> {
+    if (proxyHelpDismissed || rtcLive) return;
+    const generation = viewerGeneration;
+    proxyProbe ??= restrictedFirefoxIce();
+    const restricted = await proxyProbe;
+    if (restricted && generation === viewerGeneration && !rtcLive && !proxyHelpDismissed &&
+        qs("#status").textContent === "compatibility") {
+      qs("#proxyHelp").classList.remove("hidden");
+    }
+  }
+  qs("#proxyDismiss").addEventListener("click", () => {
+    proxyHelpDismissed = true;
+    qs("#proxyHelp").classList.add("hidden");
+  });
+  qs("#proxyEnable").addEventListener("click", async () => {
+    const button = qs<HTMLButtonElement>("#proxyEnable");
+    const result = qs("#proxyHelpResult");
+    const generation = viewerGeneration;
+    button.disabled = true;
+    result.textContent = "Choose Allow in your browser’s permission prompt.";
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      // Never attach, inspect, record, or publish this stream. Stop every track
+      // before any asynchronous retry or UI work, including stale requests.
+      for (const track of stream.getTracks()) track.stop();
+      if (generation !== viewerGeneration || rtcLive || proxyHelpDismissed || !button.isConnected) return;
+      result.textContent = "Microphone stopped. Retrying live playback. If it stays in compatibility mode, reload this page and rejoin the stream. If needed, use Ctrl+I → Permissions → Use the microphone → Allow, then rejoin. This grants the site microphone access; you can revoke it afterwards.";
+      proxyHelpDismissed = true;
+      qs<HTMLFormElement>("#gate").requestSubmit();
+    } catch {
+      result.textContent = "Microphone access was not granted or no device was available. You can keep watching in compatibility mode. To set permission without opening a microphone, use Ctrl+I → Permissions → Use the microphone → Allow, then rejoin.";
+    } finally {
+      button.disabled = false;
+    }
+  });
+
   const joinBtn = qs<HTMLButtonElement>("#join");
   let mediaUnlocked = false;
   const tapPlay = (): void => {
@@ -3289,6 +3380,8 @@ function renderViewer(roomId: string): void {
     joinBtn.disabled = true;
     rtcGaveUp = false;
     rtcLive = false;
+    viewerGeneration++;
+    setStatus("connecting", false);
     pcmCtx ??= new AudioContext();
     void pcmCtx.resume();
     try {
@@ -3375,7 +3468,13 @@ function renderViewer(roomId: string): void {
       );
       people();
       void room
-        .connect(joined.livekitUrl, joined.token, { peerConnectionTimeout: 20_000, maxRetries: 1 })
+        .connect(joined.livekitUrl, joined.token, {
+          // Tor signaling and TURN/TLS handshakes can be slow. Compatibility
+          // playback starts independently while this connection is attempted.
+          websocketTimeout: 60_000,
+          peerConnectionTimeout: 45_000,
+          maxRetries: 1,
+        })
         .then(() => {
           stopPing?.();
           stopPing = bindRoomPing(room!, room!.localParticipant.identity || selfId, pingById, () =>

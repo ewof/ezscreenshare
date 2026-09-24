@@ -89,7 +89,7 @@ pnpm dev
 pnpm electron:dev
 ```
 
-Production: copy `.env.prod.example` → `.env.prod` and `config/livekit.prod.yaml.example` → `config/livekit.prod.yaml`, then `docker compose -f docker-compose.prod.yml up`. Do not rsync local `docker-compose.yml` onto a server (that file is localhost LiveKit). Those env/yaml files are gitignored; the examples are what belong in git.
+Production: copy `.env.prod.example` → `.env.prod` on the API host and run `docker compose -f docker-compose.prod.yml up`. Run LiveKit on the VPS that owns the public IP with `deploy/livekit-vps.compose.yml` and `config/livekit.prod.yaml.example` (as `livekit.yaml` next to that compose file). Do not put nginx stream in front of the UDP media port, and do not rsync local `docker-compose.yml` onto a server (that file is localhost LiveKit). The env and yaml files are gitignored; the examples are what belong in git.
 
 Use a public name like `share.example.com` and TURN/TLS as `turn.example.com` (the client rewrites `share.` → `turn.` on the same parent domain). Set `PUBLIC_URL` on the server. Desktop hosts type that URL into the app once.
 

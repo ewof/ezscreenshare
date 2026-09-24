@@ -1,0 +1,12 @@
+# LiveKit on the VPS that owns rtc.node_ip. Host networking so ICE/TURN bind
+# 21115-21117 directly. Do not also listen on those ports in nginx stream.
+services:
+  livekit:
+    image: livekit/livekit-server:v1.9.1
+    container_name: ezscreenshare-livekit
+    restart: unless-stopped
+    network_mode: host
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+      - ./certs:/certs:ro

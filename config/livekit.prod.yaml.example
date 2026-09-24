@@ -1,13 +1,14 @@
-# Copy to livekit.prod.yaml on the LiveKit host.
-# node_ip is the public address viewers connect to (VPS), not a home WAN.
+# Copy to livekit.prod.yaml on the VPS that owns node_ip.
+# LiveKit has to bind that address itself. An nginx UDP proxy in front of it
+# splits one viewer across workers and makes quality fall as viewers join.
 # keys.ezs must match LIVEKIT_API_SECRET in .env.prod.
 port: 7880
 log_level: info
 bind_addresses:
   - 127.0.0.1
 rtc:
-  # Limit ICE to the interface that receives forwarded media. Replace eth0.
-  # Mapping Docker/VPN interfaces to the same node_ip can break UDP/TURN.
+  # Limit ICE to the public NIC. Replace eth0. Docker and VPN interfaces
+  # advertised as node_ip break UDP and TURN.
   # interfaces:
   #   includes: [eth0]
   tcp_port: 21115

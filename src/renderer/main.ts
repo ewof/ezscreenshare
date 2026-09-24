@@ -1,5 +1,6 @@
 import { LiveBuffer } from "./live-buffer";
 import { normalizeAudioSelection, includesAudioApp, audioSelectionLabel, type AudioSelection } from "../shared/audio-selection.mjs";
+import { positiveRttMs, selectRttMs } from "../shared/rtt.mjs";
 import { startMacAudio, stopMacAudio } from "./macos-audio";
 import compatAudioUrl from "./compat-audio.worklet.js?url&no-inline";
 import {
@@ -285,7 +286,7 @@ function roomOpts(kind: "host" | "viewer") {
       videoCodec: "h264" as const,
       backupCodec: { codec: "vp8" as const },
       dtx: false,
-      red: true,
+      red: false,
       simulcast: kind === "host",
       degradationPreference: "maintain-framerate" as RTCDegradationPreference,
     },
@@ -368,26 +369,7 @@ function renderPeople(ul: HTMLElement, rows: PersonRow[]): void {
 }
 
 function rttFromReport(report: RTCStatsReport): number | undefined {
-  let best: number | undefined;
-  report.forEach((s) => {
-    const rec = s as {
-      type?: string;
-      currentRoundTripTime?: number;
-      roundTripTime?: number;
-      nominated?: boolean;
-      state?: string;
-    };
-    let sec: number | undefined;
-    if (rec.type === "candidate-pair" && (rec.nominated || rec.state === "succeeded")) {
-      sec = rec.currentRoundTripTime;
-    } else if (rec.type === "remote-inbound-rtp" || rec.type === "remote-outbound-rtp") {
-      sec = rec.roundTripTime;
-    }
-    if (sec == null || !Number.isFinite(sec) || sec < 0) return;
-    const ms = Math.round(sec < 10 ? sec * 1000 : sec);
-    if (best == null || ms < best) best = ms;
-  });
-  return best;
+  return selectRttMs(report.values());
 }
 
 async function roomRttMs(room: Room): Promise<number | undefined> {
@@ -403,9 +385,8 @@ async function roomRttMs(room: Room): Promise<number | undefined> {
         const stats = await track.getSenderStats();
         const list = Array.isArray(stats) ? stats : stats ? [stats] : [];
         for (const s of list) {
-          if (s.roundTripTime == null || !Number.isFinite(s.roundTripTime)) continue;
-          const v = s.roundTripTime;
-          return Math.round(v < 10 ? v * 1000 : v);
+          const ms = positiveRttMs(s.roundTripTime);
+          if (ms != null) return ms;
         }
       } catch {
         /* try RTCStats next */
@@ -434,8 +415,8 @@ function bindRoomPing(
     try {
       const msg = JSON.parse(decoder.decode(payload)) as { t?: string; ms?: unknown };
       if (msg.t !== "ezs-ping" || typeof msg.ms !== "number" || !participant) return;
-      if (!Number.isFinite(msg.ms)) return;
-      const ms = Math.round(Math.min(60_000, Math.max(0, msg.ms)));
+      if (!Number.isFinite(msg.ms) || msg.ms <= 0) return;
+      const ms = Math.round(Math.min(60_000, msg.ms));
       pingById.set(participant.identity, ms);
       onUpdate(pingById.get(identity));
     } catch {
@@ -907,6 +888,17 @@ function startIngest(
     }).catch((err) => console.error("[ezscreenshare] audio capture", err));
   };
 
+  // Pulling the published track into an AudioContext makes Chromium glitch that
+  // same track on the live WebRTC send. Only tap while a compat viewer needs it.
+  let audioTapWanted = false;
+  const syncAudioTap = (): void => {
+    const need = wantPcm || wantRaw;
+    if (need === audioTapWanted) return;
+    audioTapWanted = need;
+    if (need) hookAudio(srcStream);
+    else unhookAudio();
+  };
+
   const closeEnc = (): void => {
     try {
       enc?.close();
@@ -1102,7 +1094,7 @@ function startIngest(
   };
 
   bindVideo(srcStream);
-  hookAudio(srcStream);
+  syncAudioTap();
   drawTimer = window.setInterval(paint, Math.round(1000 / fps));
 
   ws.addEventListener("message", (ev) => {
@@ -1144,6 +1136,7 @@ function startIngest(
         wantPcm = msg.viewers.some((v) => v.pcm && !v.rtc);
         wantRaw = msg.viewers.some((v) => !v.rtc && !v.jpeg && !v.mse);
         mseWatchers = msg.viewers.filter((v) => v.mse && !v.rtc).length;
+        syncAudioTap();
         onWatchers(msg.viewers);
         if (lastOpusCfg && ws.readyState === WebSocket.OPEN) ws.send(lastOpusCfg);
       } else if (msg.t === "watchers" && Array.isArray(msg.names)) {
@@ -1158,7 +1151,7 @@ function startIngest(
     setStream(next) {
       srcStream = next;
       bindVideo(next);
-      hookAudio(next);
+      if (audioTapWanted) hookAudio(next);
       closeEnc();
       stopRec();
     },
@@ -2737,7 +2730,7 @@ function renderHost(): void {
         audioPub = await room.localParticipant.publishTrack(audio, {
           source: Track.Source.ScreenShareAudio,
           stream: "screenshare",
-          red: true,
+          red: false,
           dtx: false,
         });
       }
@@ -2807,7 +2800,11 @@ function renderHost(): void {
         (viewers) => {
           fallbackWatchers = viewers;
           for (const w of viewers) {
-            if (w.id && w.rtt != null) pingById.set(w.id, w.rtt);
+            // A live viewer's media RTT arrives on the data channel. Replacing
+            // it with this websocket sample every couple of seconds flickers.
+            if (!w.id || !(w.rtt != null && w.rtt > 0)) continue;
+            if (w.rtc && (pingById.get(w.id) ?? 0) > 0) continue;
+            pingById.set(w.id, w.rtt);
           }
           people();
         },
@@ -2985,7 +2982,7 @@ function renderHost(): void {
         audioPub = await room.localParticipant.publishTrack(audio, {
           source: Track.Source.ScreenShareAudio,
           stream: "screenshare",
-          red: true,
+          red: false,
           dtx: false,
         });
       }
@@ -3234,13 +3231,14 @@ function renderViewer(roomId: string): void {
   function attach(track: RemoteTrack, pub: RemoteTrackPublication, participant: RemoteParticipant): void {
     if (participant.identity !== "host") return;
     if (track.kind !== Track.Kind.Video && track.kind !== Track.Kind.Audio) return;
-    // Give audio and video the same low-latency target; never tune one alone.
+    // Same cushion for audio and video so they stay in sync. 100ms underruns on
+    // this path and the gaps sound like clipping; 200ms covers ordinary jitter.
     const receiver = track.receiver;
     try {
       if (receiver && "jitterBufferTarget" in receiver) {
-        (receiver as RTCRtpReceiver & { jitterBufferTarget: number }).jitterBufferTarget = 100;
+        (receiver as RTCRtpReceiver & { jitterBufferTarget: number }).jitterBufferTarget = 200;
       } else if (receiver && "playoutDelayHint" in receiver) {
-        track.setPlayoutDelay(0.1);
+        track.setPlayoutDelay(0.2);
       }
     } catch { /* Browser retains its automatic jitter buffer. */ }
     track.attach(video);
@@ -3521,8 +3519,12 @@ function renderViewer(roomId: string): void {
             people();
           },
           onRtt: (ms) => {
-            pingById.set(selfId, ms);
+            // Compatibility ping. Once live playback has a real media RTT, the
+            // websocket sample must not overwrite it or the number flickers.
+            if (!(ms > 0)) return;
             const liveId = room?.localParticipant.identity;
+            if (rtcLive && ((liveId && (pingById.get(liveId) ?? 0) > 0) || (pingById.get(selfId) ?? 0) > 0)) return;
+            pingById.set(selfId, ms);
             if (liveId) pingById.set(liveId, ms);
             people();
             if (room) {

@@ -30,33 +30,39 @@ class CompatPlayback extends AudioWorkletProcessor {
     this.position = 0;
     this.seconds = 0;
     this.started = false;
+    this.target = 0.35;
     this.port.onmessage = ({ data }) => {
       if (data.reset) {
         this.queue = [];
         this.position = this.seconds = 0;
         this.started = false;
+        this.target = 0.35;
         return;
       }
       if (!(data.samples instanceof Int16Array) || !data.samples.length ||
           !Number.isFinite(data.rate) || data.rate < 8000 || data.rate > 192000) return;
       this.queue.push(data);
       this.seconds += data.samples.length / data.rate;
-      // A burst after a network stall must not become seconds of stale audio.
-      while (this.seconds > 0.2 && this.queue.length > 1) {
-        const old = this.queue.shift();
-        this.seconds -= (old.samples.length - this.position) / old.rate;
-        this.position = 0;
+      // Allow ordinary network batches to fit inside the jitter cushion.
+      // Only discard audio when we are substantially behind real time.
+      if (this.seconds > this.target + 1.5) {
+        while (this.seconds > this.target && this.queue.length > 1) {
+          const old = this.queue.shift();
+          this.seconds -= (old.samples.length - this.position) / old.rate;
+          this.position = 0;
+        }
       }
     };
   }
   process(_inputs, outputs) {
     const out = outputs[0][0];
     out.fill(0);
-    if (!this.started && this.seconds < 0.04) return true;
+    if (!this.started && this.seconds + 1e-9 < this.target) return true;
     this.started = true;
     for (let i = 0; i < out.length; i++) {
       const packet = this.queue[0];
       if (!packet) {
+        this.target = Math.min(0.8, this.target + 0.15);
         this.started = false;
         this.seconds = 0;
         break; // Leave silence, never repeat the last sample or packet.

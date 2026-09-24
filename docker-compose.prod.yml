@@ -1,18 +1,10 @@
-# Production. Independent compose so restarting this stack does not bounce
-# other services. LiveKit uses host networking for ICE/TURN ports 21115-21117.
+# Production API on the home server. LiveKit itself runs on the VPS that owns
+# the public IP (deploy/livekit-vps.compose.yml). Proxying its UDP port through
+# nginx splits each WebRTC flow across workers and fans every viewer back out
+# the home uplink.
 #
 #   docker compose -f docker-compose.prod.yml up
 services:
-  livekit:
-    image: livekit/livekit-server:v1.9.1
-    container_name: ezscreenshare-livekit
-    restart: unless-stopped
-    network_mode: host
-    command: --config /etc/livekit.yaml
-    volumes:
-      - ./config/livekit.prod.yaml:/etc/livekit.yaml:ro
-      - ./turn-certs:/certs:ro
-
   api:
     build: .
     container_name: ezscreenshare-api
@@ -21,5 +13,3 @@ services:
     env_file: .env.prod
     volumes:
       - ./.env.prod:/app/.env.prod:ro
-    depends_on:
-      - livekit

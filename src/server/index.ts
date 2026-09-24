@@ -873,8 +873,8 @@ server.on("upgrade", (req, socket, head) => {
             if (!watcher.rtc && watcher.mse) requestWebmRestart(rec);
           } else if (msg.t === "ping") {
             watcher.ws.send(JSON.stringify({ t: "pong", n: msg.n }));
-          } else if (msg.t === "rtt" && typeof msg.ms === "number" && Number.isFinite(msg.ms)) {
-            watcher.rtt = Math.round(Math.min(60_000, Math.max(0, msg.ms)));
+          } else if (msg.t === "rtt" && typeof msg.ms === "number" && Number.isFinite(msg.ms) && msg.ms > 0) {
+            watcher.rtt = Math.round(Math.min(60_000, msg.ms));
             notifyHost(rec);
           }
         } catch {

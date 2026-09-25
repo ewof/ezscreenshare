@@ -1,6 +1,17 @@
 import { LiveBuffer } from "./live-buffer";
 import { normalizeAudioSelection, includesAudioApp, audioSelectionLabel, type AudioSelection } from "../shared/audio-selection.mjs";
 import { positiveRttMs, selectRttMs } from "../shared/rtt.mjs";
+import {
+  audioBitrate,
+  audioQuality,
+  compatVideoBitrate,
+  contentHintFor,
+  degradationFor,
+  pictureQuality,
+  videoBitrate,
+  type AudioQuality,
+  type PictureQuality,
+} from "../shared/quality.mjs";
 import { startMacAudio, stopMacAudio } from "./macos-audio";
 import compatAudioUrl from "./compat-audio.worklet.js?url&no-inline";
 import {
@@ -84,7 +95,7 @@ const statsKey = "ezscreenshare.stats";
 const showViewersKey = "ezscreenshare.showViewers";
 const FPS_VALUES = [5, 15, 24, 25, 30, 60] as const;
 
-function fpsSelectHtml(id: string, selected = 30): string {
+function fpsSelectHtml(id: string, selected = 24): string {
   const opts = FPS_VALUES.map(
     (f) => `<option value="${f}"${f === selected ? " selected" : ""}>${f}</option>`,
   ).join("");
@@ -93,28 +104,26 @@ function fpsSelectHtml(id: string, selected = 30): string {
           </label>`;
 }
 
-function bitrateFor(height: number, fps: number): number {
-  const table: Record<number, Record<number, number>> = {
-    480: { 5: 350_000, 15: 500_000, 24: 700_000, 25: 700_000, 30: 700_000, 60: 1_000_000 },
-    720: { 5: 500_000, 15: 800_000, 24: 1_000_000, 25: 1_050_000, 30: 1_200_000, 60: 2_000_000 },
-    1080: { 5: 800_000, 15: 1_400_000, 24: 1_800_000, 25: 1_900_000, 30: 2_500_000, 60: 4_000_000 },
-    1440: { 5: 1_200_000, 15: 2_200_000, 24: 3_200_000, 25: 3_400_000, 30: 4_000_000, 60: 6_000_000 },
+function qualitySelectHtml(id: string, kind: "picture" | "audio"): string {
+  const picture = kind === "picture";
+  const label = picture ? "picture" : "audio quality";
+  const title = picture
+    ? "Cleaner text holds the resolution you picked when bitrate dips, so text and UI stay sharp. Smoother video keeps the frame rate and lets the picture go soft."
+    : "Higher sounds closer to the original and uses more bandwidth.";
+  const options = picture
+    ? `<option value="sharp">cleaner text</option><option value="smooth">smoother video</option><option value="max" selected>max</option>`
+    : `<option value="speech" selected>speech</option><option value="standard">standard</option><option value="high">high</option><option value="max">max</option>`;
+  return `<label class="field" title="${title}">${label}
+            <select id="${id}" title="${title}">${options}</select>
+          </label>`;
+}
+
+function screenSharePublishOpts(height: number, fps: number, picture: PictureQuality) {
+  const encoding = {
+    maxBitrate: videoBitrate(height, fps, picture),
+    maxFramerate: fps,
+    priority: picture === "smooth" ? ("medium" as const) : ("high" as const),
   };
-  const row =
-    height <= 480 ? table[480]! : height <= 720 ? table[720]! : height <= 1080 ? table[1080]! : table[1440]!;
-  return row[fps] ?? row[30] ?? 1_200_000;
-}
-
-function ingestBitrate(height: number, fps: number): number {
-  return Math.min(bitrateFor(height, fps), 4_000_000);
-}
-
-function contentHintFor(fps: number): "motion" | "detail" {
-  return fps >= 24 ? "motion" : "detail";
-}
-
-function screenSharePublishOpts(height: number, fps: number) {
-  const encoding = { maxBitrate: bitrateFor(height, fps), maxFramerate: fps };
   const lowH = Math.min(480, Math.max(180, Math.round(height / 2)));
   const lowW = Math.round(lowH * (16 / 9));
   return {
@@ -125,8 +134,8 @@ function screenSharePublishOpts(height: number, fps: number) {
     backupCodec: { codec: "vp8" as const },
     screenShareEncoding: encoding,
     screenShareSimulcastLayers:
-      height > 480 ? [new VideoPreset(lowW, lowH, bitrateFor(lowH, fps), fps)] : undefined,
-    degradationPreference: "maintain-framerate" as RTCDegradationPreference,
+      height > 480 ? [new VideoPreset(lowW, lowH, videoBitrate(lowH, fps, picture), fps)] : undefined,
+    degradationPreference: degradationFor(picture),
   };
 }
 
@@ -134,11 +143,13 @@ async function applySenderQuality(
   pub: LocalTrackPublication | null,
   height: number,
   fps: number,
+  picture: PictureQuality,
 ): Promise<void> {
   const track = pub?.videoTrack ?? (pub?.track as LocalVideoTrack | undefined);
   if (!track) return;
+  const preference = degradationFor(picture);
   try {
-    await track.setDegradationPreference("maintain-framerate");
+    await track.setDegradationPreference(preference);
   } catch {
     /* older senders */
   }
@@ -149,15 +160,33 @@ async function applySenderQuality(
     if (!params.encodings?.length) return;
     const n = params.encodings.length;
     params.encodings.forEach((enc, i) => {
+      const top = i === n - 1;
       enc.maxFramerate = fps;
-      const layerH = i === n - 1 ? height : Math.max(180, Math.round(height / 2 ** (n - 1 - i)));
-      enc.maxBitrate = bitrateFor(layerH, fps);
+      const layerH = top ? height : Math.max(180, Math.round(height / 2 ** (n - 1 - i)));
+      enc.maxBitrate = videoBitrate(layerH, fps, picture);
+      const priority = top && picture !== "smooth" ? "high" : "low";
+      enc.priority = priority;
+      enc.networkPriority = priority;
     });
     (params as RTCRtpSendParameters & { degradationPreference?: RTCDegradationPreference }).degradationPreference =
-      "maintain-framerate";
+      preference;
     await sender.setParameters(params);
   } catch (e) {
     console.warn("[ezscreenshare] setParameters", e);
+  }
+}
+
+async function applyAudioSenderBitrate(pub: LocalTrackPublication | null, bps: number): Promise<void> {
+  const track = pub?.audioTrack ?? (pub?.track as LocalAudioTrack | undefined);
+  const sender = track?.sender;
+  if (!sender?.getParameters) return;
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings?.length) return;
+    for (const enc of params.encodings) enc.maxBitrate = bps;
+    await sender.setParameters(params);
+  } catch (e) {
+    console.warn("[ezscreenshare] audio bitrate", e);
   }
 }
 
@@ -288,7 +317,7 @@ function roomOpts(kind: "host" | "viewer") {
       dtx: false,
       red: false,
       simulcast: kind === "host",
-      degradationPreference: "maintain-framerate" as RTCDegradationPreference,
+      degradationPreference: "maintain-resolution" as RTCDegradationPreference,
     },
     audioCaptureDefaults: {
       autoGainControl: false,
@@ -466,7 +495,7 @@ const WEB_ACFG = 2;
 const WEB_ACHUNK = 3;
 const OPUS_CFG = 0;
 const OPUS_FRAME = 1;
-const OPUS_BITRATE = 64_000;
+
 
 function copyAb(u8: Uint8Array): ArrayBuffer {
   const out = new ArrayBuffer(u8.byteLength);
@@ -671,11 +700,11 @@ function startIngest(
   roomId: string,
   ingestToken: string,
   onWatchers: (viewers: CompatWatcher[]) => void,
-  quality?: { fps: number; bitrate: number },
+  quality?: { fps: number; bitrate: number; audioBitrate?: number },
 ): {
   stop: () => void;
   setStream: (s: MediaStream) => void;
-  setQuality: (fps: number, bitrate: number) => void;
+  setQuality: (fps: number, bitrate: number, audioBitrate?: number) => void;
   setViewersVisible: (on: boolean) => void;
 } {
   const ws = openFallback(`/ws/ingest/${encodeURIComponent(roomId)}`, ingestToken);
@@ -693,6 +722,7 @@ function startIngest(
   let srcStream = stream;
   let fps = Math.max(2, Math.min(30, quality?.fps ?? 15));
   let bitrate = quality?.bitrate ?? 700_000;
+  let audioBitrate = quality?.audioBitrate ?? 160_000;
   let webmRateScale = 1;
   let webmQualityAt = performance.now();
   const playbackHealth = new Map<string, { at: number; stalls: number }>();
@@ -816,7 +846,7 @@ function startIngest(
       codec: "opus",
       numberOfChannels: 1,
       sampleRate,
-      bitrate: OPUS_BITRATE,
+      bitrate: audioBitrate,
     });
     aenc = next;
     return next;
@@ -1000,7 +1030,7 @@ function startIngest(
     try {
       rec = new MediaRecorder(new MediaStream(recAudioTracks), {
         mimeType: mime,
-        audioBitsPerSecond: 64_000,
+        audioBitsPerSecond: audioBitrate,
       });
     } catch {
       rec = new MediaRecorder(new MediaStream(recAudioTracks), { mimeType: mime });
@@ -1155,9 +1185,17 @@ function startIngest(
       closeEnc();
       stopRec();
     },
-    setQuality(nextFps, nextBitrate) {
-      fps = Math.max(2, Math.min(30, nextFps));
-      bitrate = Math.max(120_000, nextBitrate);
+    setQuality(nextFps, nextBitrate, nextAudioBitrate) {
+      const nextFpsClamped = Math.max(2, Math.min(30, nextFps));
+      const nextVideo = Math.max(120_000, nextBitrate);
+      if (nextAudioBitrate && nextAudioBitrate !== audioBitrate) {
+        audioBitrate = Math.max(16_000, nextAudioBitrate);
+        closeAudioEnc();
+        stopAudioRec();
+      }
+      if (nextFpsClamped === fps && nextVideo === bitrate) return;
+      fps = nextFpsClamped;
+      bitrate = nextVideo;
       window.clearInterval(drawTimer);
       drawTimer = window.setInterval(paint, Math.round(1000 / fps));
       closeEnc();
@@ -2036,9 +2074,9 @@ function viewerIdentity(): string {
   return id;
 }
 
-function applyQuality(track: MediaStreamTrack, height: number, fps: number): void {
+function applyQuality(track: MediaStreamTrack, height: number, fps: number, picture: PictureQuality): void {
   const width = Math.round(height * (16 / 9));
-  const hint = contentHintFor(fps);
+  const hint = contentHintFor(fps, picture);
   try {
     (track as MediaStreamTrack & { contentHint?: string }).contentHint = hint;
   } catch {
@@ -2058,6 +2096,7 @@ async function getStream(opts: {
   audio: boolean;
   height: number;
   fps: number;
+  picture: PictureQuality;
 }): Promise<MediaStream> {
   if (isElectron && window.ez && opts.sourceId) {
     await window.ez.setCapture(opts.sourceId, opts.audio);
@@ -2087,7 +2126,7 @@ async function getStream(opts: {
   }
   const stream = await navigator.mediaDevices.getDisplayMedia(display);
   const video = stream.getVideoTracks()[0];
-  if (video) applyQuality(video, opts.height, opts.fps);
+  if (video) applyQuality(video, opts.height, opts.fps, opts.picture);
   if (wantsAudio && windowsLoopback) {
     lastAudioLabel = stream.getAudioTracks().length ? "Entire system" : "";
     if (!stream.getAudioTracks().length) console.warn("[ezscreenshare] Windows loopback returned no audio track");
@@ -2252,12 +2291,14 @@ function renderHost(): void {
           <label class="field">resolution
             <select id="res">
               <option value="480">480p</option>
-              <option value="720" selected>720p</option>
-              <option value="1080">1080p</option>
+              <option value="720">720p</option>
+              <option value="1080" selected>1080p</option>
               <option value="1440">1440p</option>
             </select>
           </label>
-          ${fpsSelectHtml("fps", 30)}
+          ${fpsSelectHtml("fps")}
+          ${qualitySelectHtml("picture", "picture")}
+          ${qualitySelectHtml("audioQuality", "audio")}
         </div>
         <div class="row">
           <label class="check ${isElectron ? "" : "hidden"}"><input id="audio" type="checkbox" checked /> share audio</label>
@@ -2298,9 +2339,9 @@ function renderHost(): void {
             <button class="btn secondary" id="copy" type="button">copy link</button>
           </div>
           <div class="hud-actions">
+            <button class="btn secondary" id="statsToggle" type="button">stats</button>
             <label class="check"><input id="showViewersLive" type="checkbox" checked /> viewers see who's watching</label>
             <label class="check"><input id="linkPreviewsLive" type="checkbox" /> embeds have thumbnail preview (only passwordless streams; updated every minute)</label>
-            <button class="btn secondary" id="statsToggle" type="button">stats</button>
             <button class="btn secondary" id="switch" type="button">change source</button>
             <button class="btn secondary ${isElectron ? "" : "hidden"}" id="refreshLive" type="button">refresh sources</button>
             <button class="btn secondary" id="stop" type="button">stop</button>
@@ -2316,11 +2357,13 @@ function renderHost(): void {
             <select id="resLive">
               <option value="480">480p</option>
               <option value="720">720p</option>
-              <option value="1080">1080p</option>
+              <option value="1080" selected>1080p</option>
               <option value="1440">1440p</option>
             </select>
           </label>
           ${fpsSelectHtml("fpsLive")}
+          ${qualitySelectHtml("pictureLive", "picture")}
+          ${qualitySelectHtml("audioQualityLive", "audio")}
           <div class="desktop-filter-wrap hidden" id="desktopFiltersLive">
             <div class="source-heading">desktops</div>
             <div class="desktop-tabs" role="group" aria-label="Show video sources from desktops"></div>
@@ -2348,6 +2391,8 @@ function renderHost(): void {
   hostKeyInput.value = localStorage.getItem(hostKey) || "";
   const resolutionInput = qs<HTMLSelectElement>("#res");
   const fpsInput = qs<HTMLSelectElement>("#fps");
+  const pictureInput = qs<HTMLSelectElement>("#picture");
+  const audioQualityInput = qs<HTMLSelectElement>("#audioQuality");
   const viewerPasswordInput = qs<HTMLInputElement>("#password");
   const linkPreviews = qs<HTMLInputElement>("#linkPreviews");
   const linkPreviewsLive = qs<HTMLInputElement>("#linkPreviewsLive");
@@ -2358,7 +2403,12 @@ function renderHost(): void {
   viewerPasswordInput.addEventListener("input", syncPreviewPassword);
   const audioInput = qs<HTMLInputElement>("#audio");
   const tcpInput = qs<HTMLInputElement>("#tcp");
-  for (const [input, key] of [[resolutionInput, "resolution"], [fpsInput, "fps"]] as const) {
+  for (const [input, key] of [
+    [resolutionInput, "resolution"],
+    [fpsInput, "fps"],
+    [pictureInput, "picture"],
+    [audioQualityInput, "audioQuality"],
+  ] as const) {
     const saved = localStorage.getItem(`ezscreenshare.${key}`);
     if (saved && [...input.options].some(option => option.value === saved)) input.value = saved;
   }
@@ -2372,6 +2422,8 @@ function renderHost(): void {
     localStorage.setItem(hostKey, hostKeyInput.value);
     localStorage.setItem("ezscreenshare.resolution", resolutionInput.value);
     localStorage.setItem("ezscreenshare.fps", fpsInput.value);
+    localStorage.setItem("ezscreenshare.picture", pictureInput.value);
+    localStorage.setItem("ezscreenshare.audioQuality", audioQualityInput.value);
     localStorage.setItem("ezscreenshare.viewerPassword", viewerPasswordInput.value);
     localStorage.setItem("ezscreenshare.shareAudio", audioInput.checked ? "1" : "0");
     localStorage.setItem("ezscreenshare.forceTcp", tcpInput.checked ? "1" : "0");
@@ -2702,7 +2754,13 @@ function renderHost(): void {
     setPingPill(document.querySelector("#ping"), pingById.get("host"));
   }
 
-  async function publish(stream: MediaStream, height: number, fps: number): Promise<void> {
+  async function publish(
+    stream: MediaStream,
+    height: number,
+    fps: number,
+    picture: PictureQuality,
+    audio: AudioQuality,
+  ): Promise<void> {
     if (!room) return;
     const prev = localStream;
     localStream = stream;
@@ -2716,26 +2774,31 @@ function renderHost(): void {
     preview.volume = 0;
     preview.srcObject = new MediaStream(stream.getVideoTracks());
     const video = stream.getVideoTracks()[0];
-    const audio = stream.getAudioTracks()[0];
+    const audioTrack = stream.getAudioTracks()[0];
     if (videoPub && video) {
       await (videoPub.track as LocalVideoTrack).replaceTrack(video);
-      await applySenderQuality(videoPub, height, fps);
+      await applySenderQuality(videoPub, height, fps, picture);
     } else if (video) {
-      videoPub = await room.localParticipant.publishTrack(video, screenSharePublishOpts(height, fps));
-      await applySenderQuality(videoPub, height, fps);
+      videoPub = await room.localParticipant.publishTrack(video, screenSharePublishOpts(height, fps, picture));
+      await applySenderQuality(videoPub, height, fps, picture);
     }
-    if (audio) {
-      if (audioPub) await (audioPub.track as LocalAudioTrack).replaceTrack(audio);
-      else {
-        audioPub = await room.localParticipant.publishTrack(audio, {
+    const audioBps = audioBitrate(audio);
+    if (audioTrack) {
+      audioTrack.contentHint = audio === "speech" ? "speech" : "music";
+      if (audioPub) {
+        await (audioPub.track as LocalAudioTrack).replaceTrack(audioTrack);
+        await applyAudioSenderBitrate(audioPub, audioBps);
+      } else {
+        audioPub = await room.localParticipant.publishTrack(audioTrack, {
           source: Track.Source.ScreenShareAudio,
           stream: "screenshare",
           red: false,
           dtx: false,
+          audioPreset: { maxBitrate: audioBps, priority: "high" },
         });
       }
     }
-    if (!audio) {
+    if (!audioTrack) {
       stopMacAudio();
       await window.ez?.releaseAudioTap();
       if (audioPub?.track) {
@@ -2761,6 +2824,8 @@ function renderHost(): void {
     if (isElectron && !selected) { err.textContent = "Choose a video source first."; return; }
     const height = Number(qs<HTMLSelectElement>("#res").value);
     const fps = Number(qs<HTMLSelectElement>("#fps").value);
+    const picture = pictureQuality(qs<HTMLSelectElement>("#picture").value);
+    const sound = audioQuality(qs<HTMLSelectElement>("#audioQuality").value);
     const audio = qs<HTMLInputElement>("#audio").checked;
     const forceTcp = qs<HTMLInputElement>("#tcp").checked;
     const showViewers = showViewersSetup.checked;
@@ -2781,6 +2846,7 @@ function renderHost(): void {
         audio,
         height,
         fps,
+        picture,
       });
       captured = stream;
       room = new Room(roomOpts("host"));
@@ -2791,7 +2857,7 @@ function renderHost(): void {
       stopPing?.();
       pingById.clear();
       stopPing = bindRoomPing(room, "host", pingById, () => people());
-      await publish(stream, height, fps);
+      await publish(stream, height, fps, picture, sound);
       ingest?.stop();
       ingest = startIngest(
         stream,
@@ -2808,7 +2874,7 @@ function renderHost(): void {
           }
           people();
         },
-        { fps, bitrate: ingestBitrate(height, fps) },
+        { fps, bitrate: compatVideoBitrate(height, fps, picture), audioBitrate: audioBitrate(sound) },
       );
       ingest.setViewersVisible(showViewers);
       previewSession = created;
@@ -2840,6 +2906,8 @@ function renderHost(): void {
       qs<HTMLInputElement>("#link").value = created.publicUrl;
       qs<HTMLSelectElement>("#resLive").value = String(height);
       qs<HTMLSelectElement>("#fpsLive").value = String(fps);
+      qs<HTMLSelectElement>("#pictureLive").value = picture;
+      qs<HTMLSelectElement>("#audioQualityLive").value = sound;
       history.replaceState(null, "", `/r/${created.roomId}`);
     } catch (e) {
       err.textContent = e instanceof Error ? e.message : String(e);
@@ -2906,6 +2974,8 @@ function renderHost(): void {
   async function switchLiveSource(source?: Source): Promise<void> {
     const height = Number(qs<HTMLSelectElement>("#resLive").value);
     const fps = Number(qs<HTMLSelectElement>("#fpsLive").value);
+    const picture = pictureQuality(qs<HTMLSelectElement>("#pictureLive").value);
+    const sound = audioQuality(qs<HTMLSelectElement>("#audioQualityLive").value);
     const audio = qs<HTMLInputElement>("#audio").checked;
     liveErr.textContent = "";
     try {
@@ -2913,10 +2983,10 @@ function renderHost(): void {
         track.stop();
         localStream?.removeTrack(track);
       });
-      const stream = await getStream({ sourceId: source?.id, audio, height, fps });
-      await publish(stream, height, fps);
+      const stream = await getStream({ sourceId: source?.id, audio, height, fps, picture });
+      await publish(stream, height, fps, picture, sound);
       ingest?.setStream(stream);
-      ingest?.setQuality(fps, ingestBitrate(height, fps));
+      ingest?.setQuality(fps, compatVideoBitrate(height, fps, picture), audioBitrate(sound));
       if (isElectron && audio && stream.getAudioTracks().length === 0) await reattachAudio();
       qs("#liveSources").classList.add("hidden");
     } catch (e) {
@@ -2948,16 +3018,23 @@ function renderHost(): void {
   const onQuality = () => {
     const height = Number(qs<HTMLSelectElement>("#resLive").value);
     const fps = Number(qs<HTMLSelectElement>("#fpsLive").value);
+    const picture = pictureQuality(qs<HTMLSelectElement>("#pictureLive").value);
+    const sound = audioQuality(qs<HTMLSelectElement>("#audioQualityLive").value);
     resolutionInput.value = String(height);
     fpsInput.value = String(fps);
+    pictureInput.value = picture;
+    audioQualityInput.value = sound;
     saveHostSettings();
     const video = localStream?.getVideoTracks()[0];
-    if (video) applyQuality(video, height, fps);
-    ingest?.setQuality(fps, ingestBitrate(height, fps));
-    void applySenderQuality(videoPub, height, fps);
+    if (video) applyQuality(video, height, fps, picture);
+    ingest?.setQuality(fps, compatVideoBitrate(height, fps, picture), audioBitrate(sound));
+    void applySenderQuality(videoPub, height, fps, picture);
+    void applyAudioSenderBitrate(audioPub, audioBitrate(sound));
   };
   qs("#resLive").addEventListener("change", onQuality);
   qs("#fpsLive").addEventListener("change", onQuality);
+  qs("#pictureLive").addEventListener("change", onQuality);
+  qs("#audioQualityLive").addEventListener("change", onQuality);
   async function reattachAudio(): Promise<void> {
     if (!localStream || !room || !qs<HTMLInputElement>("#audio").checked) return;
     for (const t of localStream.getAudioTracks()) {
@@ -2975,8 +3052,11 @@ function renderHost(): void {
       return;
     }
     const audio = tmp.getAudioTracks()[0];
+    const sound = audioQuality(qs<HTMLSelectElement>("#audioQualityLive").value);
     if (audio) {
+      audio.contentHint = sound === "speech" ? "speech" : "music";
       localStream.addTrack(audio);
+      const bps = audioBitrate(sound);
       if (audioPub) await (audioPub.track as LocalAudioTrack).replaceTrack(audio);
       else {
         audioPub = await room.localParticipant.publishTrack(audio, {
@@ -2984,8 +3064,10 @@ function renderHost(): void {
           stream: "screenshare",
           red: false,
           dtx: false,
+          audioPreset: { maxBitrate: bps, priority: "high" },
         });
       }
+      await applyAudioSenderBitrate(audioPub, bps);
     } else if (audioPub?.track) {
       await room.localParticipant.unpublishTrack(audioPub.track);
       audioPub = null;

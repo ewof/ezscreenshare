@@ -12,6 +12,16 @@ Private share-a-link screen streaming. You start a room, copy a URL, friends ope
 
 Built for a small group that actually has to work: a Linux host, a Mac, an iPhone, and a friend on hardened LibreWolf behind SOCKS who will not turn proxy protections off just to watch a screen.
 
+## Download
+
+Desktop host: [latest release](https://github.com/ewof/ezscreenshare/releases/latest) (Linux AppImage and zip, Windows installer, macOS dmg).
+
+API image:
+
+```bash
+docker pull ghcr.io/ewof/ezscreenshare:latest
+```
+
 ## What it is
 
 - **Host** picks a screen, window, or (in Chromium) a tab, optional audio, optional viewer password.
